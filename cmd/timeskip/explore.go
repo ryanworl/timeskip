@@ -77,7 +77,6 @@ type explorer struct {
 	best      float64                   // the most a branch point was worth
 	pool      map[string][]*branchPoint // by template
 	all       []*branchPoint
-	n         int            // branch points saved
 	fresh     map[string]int // timelines started from setup, by template
 	branchd   map[string]int // timelines started from branch points
 	freshN    int            // ... of each template
@@ -198,16 +197,16 @@ func (x *explorer) reserve(p *plan, setup *checkpoint, e protocol.Edges, score f
 	if i < 0 {
 		return nil
 	}
-	x.n++
-	d := filepath.Join(x.dir, fmt.Sprint(x.n))
+	n := fmt.Sprint(len(x.all) + 1)
+	d := filepath.Join(x.dir, n)
 	b := &branchPoint{checkpoint: &checkpoint{dir: d, setup: setup.dir, meta: setup.meta}, Template: p.tmpl, First: p.first, Firsts: p.firsts,
 		Setup: setup.dir, Ref: &branchRef{Seed: p.seed, AtMs: e.AtMs}, score: score, saving: true}
 	if p.from != nil {
 		b.Ref.From = p.from.Ref
 	}
-	b.files = filepath.Join(x.tmp, fmt.Sprint(x.n))
+	b.files = filepath.Join(x.tmp, n)
 	if x.mem != "" && memDir(pointRoom) != "" {
-		b.files = filepath.Join(x.mem, fmt.Sprint(x.n))
+		b.files = filepath.Join(x.mem, n)
 	}
 	check(os.Mkdir(b.files, 0o755))
 	check(os.Symlink(b.files, d))
@@ -285,9 +284,7 @@ func (x *explorer) prune(b *branchPoint) {
 
 func (b *branchPoint) remove() {
 	os.RemoveAll(b.dir)
-	if b.files != "" {
-		os.RemoveAll(b.files)
-	}
+	os.RemoveAll(b.files)
 }
 
 // release notes that b's memory is no longer the base of a timeline's next

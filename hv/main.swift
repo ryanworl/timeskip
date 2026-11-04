@@ -172,7 +172,6 @@ let sysRegs: [UInt16] = (0..<16).flatMap { n in (0..<4).map { UInt16(0x8004 + 8 
 	0x8010, 0x8012, // MDCCINT, MDSCR
 	0xc005, 0xc080, 0xc081, 0xc082, // MPIDR, SCTLR, ACTLR, CPACR
 	0xc100, 0xc101, 0xc102, // TTBR0, TTBR1, TCR
-	0xc108, 0xc109, 0xc10a, 0xc10b, 0xc110, 0xc111, 0xc112, 0xc113, 0xc118, 0xc119, // pointer auth keys
 	0xc200, 0xc201, 0xc208, 0xc288, 0xc289, 0xc290, 0xc300, 0xc3a0, // SPSR, ELR, SP_EL0, AFSR0/1, ESR, FAR, PAR
 	0xc510, 0xc518, 0xc600, 0xc681, 0xc684, 0xc708, 0xd000, // MAIR, AMAIR, VBAR, CONTEXTIDR, TPIDR_EL1, CNTKCTL, CSSELR
 	0xde82, 0xde83, 0xe208, // TPIDR_EL0, TPIDRRO_EL0, SP_EL1
@@ -453,11 +452,7 @@ func psci() {
 	var r = notSupported
 	switch UInt32(truncatingIfNeeded: reg(0)) {
 	case 0x8400_0000: r = 0x1_0000 // PSCI_VERSION: 1.0
-	case 0x8400_0006: r = 2 // MIGRATE_INFO_TYPE: no migration needed
-	case 0x8400_000a: // PSCI_FEATURES
-		r = [0x8400_0000, 0x8400_0006, 0x8400_0008, 0x8400_0009, 0x8400_000a].contains(UInt32(truncatingIfNeeded: reg(1))) ? 0 : notSupported
 	case 0x8400_0008, 0x8400_0009: exit(0) // SYSTEM_OFF, SYSTEM_RESET
-	case 0x8400_0003, 0xc400_0003: r = UInt64(bitPattern: -2) // CPU_ON: there's one CPU
 	default: break
 	}
 	setReg(0, r)

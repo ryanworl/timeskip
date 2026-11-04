@@ -86,34 +86,22 @@ func stage(d string, edits []edit) *staged {
 		for _, p := range e.deleted {
 			fmt.Fprintf(&del, "%s\t%s\t%s\t%s\n", e.service, p, name, e.action)
 		}
+		// Only what the rule syncs is copied: not a whole .git or
+		// node_modules that it leaves out.
 		var paths []string
-		if exists(e.file) {
-			// Only what the rule syncs is copied: not a whole .git or
-			// node_modules that it leaves out.
-			dst := filepath.Join(s.dir, name)
-			check(filepath.WalkDir(e.file, func(p string, d fs.DirEntry, err error) error {
-				rel, _ := filepath.Rel(e.file, p)
-				if err != nil {
-					return err
-				}
-				if (rel != "." || !d.IsDir()) && e.skip != nil && e.skip(p, d.IsDir()) {
-					if d.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-				if d.Type()&^(fs.ModeDir|fs.ModeSymlink) != 0 {
-					return nil // (sockets, pipes and devices aren't synced)
-				}
-				copyEntry(p, d, filepath.Join(dst, rel))
-				if !d.IsDir() {
-					paths = append(paths, filepath.Join(e.target, rel))
-				}
-				return nil
-			}))
-			if _, err := os.Lstat(dst); err == nil { // (not if the rule leaves out its path, a file)
-				fmt.Fprintf(&replace, "%s\t%s\t%s\t%s\n", e.service, e.target, name, e.action)
+		dst := filepath.Join(s.dir, name)
+		check(bundle.Walk(e.file, e.skip, func(p string, fi fs.FileInfo) {
+			if fi.Mode().Type()&^(fs.ModeDir|fs.ModeSymlink) != 0 {
+				return // (sockets, pipes and devices aren't synced)
 			}
+			rel, _ := filepath.Rel(e.file, p)
+			copyEntry(p, fi, filepath.Join(dst, rel))
+			if !fi.IsDir() {
+				paths = append(paths, filepath.Join(e.target, rel))
+			}
+		}))
+		if _, err := os.Lstat(dst); err == nil { // (not if the file is gone or the rule leaves it out)
+			fmt.Fprintf(&replace, "%s\t%s\t%s\t%s\n", e.service, e.target, name, e.action)
 		}
 		s.paths = append(s.paths, paths)
 	}
@@ -127,13 +115,11 @@ func stage(d string, edits []edit) *staged {
 
 // copyEntry copies p, a directory (not what's in it), a symlink or a file, to
 // to, with its permissions.
-func copyEntry(p string, d fs.DirEntry, to string) {
-	fi, err := d.Info()
-	check(err)
+func copyEntry(p string, fi fs.FileInfo, to string) {
 	switch {
-	case d.IsDir():
+	case fi.IsDir():
 		check(os.Mkdir(to, fi.Mode().Perm()|0o700)) // (and writable, to fill)
-	case d.Type()&fs.ModeSymlink != 0:
+	case fi.Mode().Type()&fs.ModeSymlink != 0:
 		l, err := os.Readlink(p)
 		check(err)
 		check(os.Symlink(l, to))

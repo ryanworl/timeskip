@@ -804,7 +804,7 @@ func packSynced(syncs []Sync, dir string) (string, error) {
 	for i, y := range syncs {
 		m.Rules = append(m.Rules, SyncedRule{y.Service, y.Target, y.Action})
 		var errs []error
-		err := walk(y.Path, y.Skip, func(p string, fi fs.FileInfo) {
+		err := Walk(y.Path, y.Skip, func(p string, fi fs.FileInfo) {
 			if fi.IsDir() {
 				return
 			}
@@ -856,7 +856,7 @@ func packMounts(mounts map[string]string, dir string) (string, error) {
 		}
 		var errs []error
 		dirs := map[string]fs.FileMode{}
-		err = walk(root, nil, func(p string, fi fs.FileInfo) {
+		err = Walk(root, nil, func(p string, fi fs.FileInfo) {
 			rel, _ := filepath.Rel(root, p)
 			to := filepath.Join(dst, rel)
 			fmt.Fprintf(h, "%s %s %v\n", mounts[src], rel, fi.Mode())

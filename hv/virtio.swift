@@ -310,7 +310,7 @@ final class Blk: VirtioDevice {
 			for d in chain[1..<chain.count - 1] where status != 2 {
 				let p = mem.ptr(d.addr, d.len)
 				// (Reads and writes past the end fail rather than grow the image.)
-				if sector > capacity || UInt64(off) + UInt64(d.len) > capacity * 512 { status = 1; break }
+				if UInt64(off) + UInt64(d.len) > capacity * 512 { status = 1; break }
 				if type == 0 {
 					if pread(fd, p, d.len, off) != d.len { status = 1 }
 					written += d.len

@@ -85,11 +85,19 @@ type result struct {
 		Progress            []int
 	}
 	Timelines  []timeline
-	Properties []struct {
-		Name string
-		Pass bool
-		Hits int
-	}
+	Properties []property
+}
+
+type property struct {
+	Name string
+	Pass bool
+	Hits int
+}
+
+type assertion struct {
+	Message      string
+	Hits, True   int
+	FirstFalseMs int64 `json:"first_false_ms"`
 }
 
 type timeline struct {
@@ -110,12 +118,8 @@ type timeline struct {
 		CPUMs int64 `json:"cpu_ms"`
 	}
 	ContainerCPUMs map[string]int64 `json:"container_cpu_ms"`
-	Assertions     []struct {
-		Message      string
-		Hits, True   int
-		FirstFalseMs int64 `json:"first_false_ms"`
-	}
-	Faults []struct {
+	Assertions     []assertion
+	Faults         []struct {
 		Kind, Detail string
 		Targets      [][]string
 		AtMs         int64 `json:"at_ms"`
@@ -582,11 +586,7 @@ func TestBundles(t *testing.T) {
 		}
 		// (Drawn from the timeline's seed: a replay draws the same.)
 		_, rr, _ := run(t, "sdk-replay", "test", f, "--template", "t", "--seed", fmt.Sprint(r.Timelines[0].Seed), "--set", "drivers=1")
-		if n := slices.IndexFunc(rr.Properties, func(p struct {
-			Name string
-			Pass bool
-			Hits int
-		}) bool {
+		if n := slices.IndexFunc(rr.Properties, func(p property) bool {
 			return strings.HasPrefix(p.Name, "drew ")
 		}); n < 0 || !slices.Contains(drew, rr.Properties[n].Name) {
 			t.Errorf("a replay drew another number than %v", drew)
@@ -613,11 +613,7 @@ func TestBundles(t *testing.T) {
 		for _, tl := range r.Timelines {
 			seeds[tl.Seed] = tl
 			befores[drawn(tl, "before")], afters[drawn(tl, "after")] = true, true
-			if !slices.ContainsFunc(tl.Assertions, func(a struct {
-				Message      string
-				Hits, True   int
-				FirstFalseMs int64 `json:"first_false_ms"`
-			}) bool {
+			if !slices.ContainsFunc(tl.Assertions, func(a assertion) bool {
 				return a.Message == "ABI v2 grants a lease" && a.True == 1
 			}) {
 				t.Errorf("timeline %d: no leases through ABI v2 (%+v)", tl.Seed, tl.Assertions)
@@ -647,11 +643,7 @@ func TestBundles(t *testing.T) {
 			t.Errorf("exit %d, %d timelines, none branched after the assertion 2 s in; want 1, 4 and one", rc, len(r.Timelines))
 		}
 		for _, tl := range r.Timelines {
-			i := slices.IndexFunc(tl.Assertions, func(a struct {
-				Message      string
-				Hits, True   int
-				FirstFalseMs int64 `json:"first_false_ms"`
-			}) bool {
+			i := slices.IndexFunc(tl.Assertions, func(a assertion) bool {
 				return a.Message == "the timeline fails"
 			})
 			if i < 0 || tl.Branch != nil && (tl.Branch.AtMs > 3000 || tl.Assertions[i].FirstFalseMs <= tl.Branch.AtMs) {

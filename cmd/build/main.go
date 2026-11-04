@@ -182,26 +182,10 @@ func step(t target, name string, paths, outs []string, fn func(t target, log io.
 // Linux 6.12.56 plus the time-skip patch, with the committed config. The
 // tree stays in the cache, so a rebuild compiles only what changed.
 func kernel(t target, log io.Writer, sde int64) error {
-	w, tarball, patch := "/cache/kernel-"+t.k, file("linux-6.12.56.tar.xz"), src+"/guest/kernel/timeskip.patch"
+	w := "/cache/kernel-" + t.k
 	tree := w + "/linux-6.12.56"
-	h := sha256.New()
-	hashFile(h, tarball)
-	hashFile(h, patch)
-	key := fmt.Sprintf("%x", h.Sum(nil))
-	if b, _ := os.ReadFile(w + "/source"); string(b) != key {
-		os.RemoveAll(w)
-		if err := os.MkdirAll(w, 0o755); err != nil {
-			return err
-		}
-		if err := run(log, "", nil, "tar", "-xJf", tarball, "-C", w); err != nil {
-			return err
-		}
-		if err := run(log, "", nil, "patch", "-d", tree, "-p1", "-s", "-i", patch); err != nil {
-			return err
-		}
-		if err := os.WriteFile(w+"/source", []byte(key), 0o644); err != nil {
-			return err
-		}
+	if err := unpack(log, w, tree, file("linux-6.12.56.tar.xz"), []string{src + "/guest/kernel/timeskip.patch"}); err != nil {
+		return err
 	}
 	// (Rewriting an unchanged .config would rebuild everything.)
 	config, _ := os.ReadFile(src + "/guest/kernel/config-" + t.k)
@@ -221,6 +205,34 @@ func kernel(t target, log io.Writer, sde int64) error {
 	return install(tree+"/"+t.image, out+"/"+t.kernel, 0o644)
 }
 
+// unpack extracts tarball to tree and applies patches, unless w/source says
+// tree already holds them.
+func unpack(log io.Writer, w, tree, tarball string, patches []string) error {
+	h := sha256.New()
+	hashFile(h, tarball)
+	for _, p := range patches {
+		hashFile(h, p)
+	}
+	key := fmt.Sprintf("%x", h.Sum(nil))
+	if b, _ := os.ReadFile(w + "/source"); string(b) == key {
+		return nil
+	}
+	os.Remove(w + "/source") // (written again once the tree is whole)
+	os.RemoveAll(tree)
+	if err := os.MkdirAll(tree, 0o755); err != nil {
+		return err
+	}
+	if err := run(log, "", nil, "tar", "-xf", tarball, "-C", tree, "--strip-components=1"); err != nil {
+		return err
+	}
+	for _, p := range patches {
+		if err := run(log, "", nil, "patch", "-d", tree, "-p1", "-s", "-i", p); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(w+"/source", []byte(key), 0o644)
+}
+
 // Firecracker 1.17.0 with the patches in firecracker/, a static musl binary
 // built with the Rust toolchain its rust-toolchain.toml names.
 // The tree and cargo's cache stay in the cache volume.
@@ -237,29 +249,8 @@ func firecracker(t target, log io.Writer, sde int64) error {
 			return err
 		}
 	}
-	h := sha256.New()
-	hashFile(h, file("firecracker/archive"))
-	for _, p := range patches {
-		hashFile(h, p)
-	}
-	key := fmt.Sprintf("%x", h.Sum(nil))
-	if b, _ := os.ReadFile(w + "/source"); string(b) != key {
-		os.Remove(w + "/source") // (written again once the tree is whole)
-		os.RemoveAll(tree)
-		if err := os.MkdirAll(tree, 0o755); err != nil {
-			return err
-		}
-		if err := run(log, "", nil, "tar", "-xzf", file("firecracker/archive"), "-C", tree, "--strip-components=1"); err != nil {
-			return err
-		}
-		for _, p := range patches {
-			if err := run(log, "", nil, "patch", "-d", tree, "-p1", "-s", "-i", p); err != nil {
-				return err
-			}
-		}
-		if err := os.WriteFile(w+"/source", []byte(key), 0o644); err != nil {
-			return err
-		}
+	if err := unpack(log, w, tree, file("firecracker/archive"), patches); err != nil {
+		return err
 	}
 	toolchain, _ := os.ReadFile(tree + "/rust-toolchain.toml")
 	channel := regexp.MustCompile(`(?m)^channel = "(.+)"`).FindSubmatch(toolchain)

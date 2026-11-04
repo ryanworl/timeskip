@@ -600,7 +600,7 @@
  };
  
  struct loop_cmd {
-@@ -417,14 +431,228 @@
+@@ -417,14 +431,220 @@
  	return -EIOCBQUEUED;
  }
  
@@ -617,7 +617,8 @@
 + *   Not its filesystem's own metadata I/O (REQ_META, as the journal's
 + *   writes are, or in the block device's page cache): a failing disk's
 + *   errors stay the systems' to handle, not a broken filesystem's.
-+ * - timeskip_cache: a volatile write cache. The writes since the last flush
++ * - timeskip_cache: writing it turns on a volatile write cache, for good.
++ *   The writes since the last flush
 + *   are kept (their blocks' old contents are), and writing timeskip_cut, as
 + *   the power is cut (with nothing mounted), loses each 4 KiB block of them
 + *   with probability one half: it reads as it did before them. A disk's
@@ -778,10 +779,10 @@
 +
 +/*
 + * Lose each 4 KiB block of the writes since the last flush with probability
-+ * one half (or, if !cut, none): the newest first, so that a block lost reads
-+ * as it did before them all.
++ * one half: the newest first, so that a block lost reads as it did before
++ * them all.
 + */
-+static void timeskip_cut(struct loop_device *lo, bool cut)
++static void timeskip_cut(struct loop_device *lo)
 +{
 +	struct timeskip_write *w, *t;
 +	u64 salt = get_random_u64();
@@ -790,7 +791,7 @@
 +	list_for_each_entry_safe_reverse(w, t, &lo->ts_writes, list) {
 +		loff_t p = w->pos;
 +
-+		while (cut && p < w->pos + w->len) {
++		while (p < w->pos + w->len) {
 +			loff_t end = min_t(loff_t, round_down(p, 4096) + 4096,
 +					   w->pos + w->len), q = p;
 +
@@ -802,15 +803,6 @@
 +		timeskip_drop(lo, w);
 +	}
 +	mutex_unlock(&lo->ts_mutex);
-+}
-+
-+static void timeskip_reset(struct loop_device *lo)
-+{
-+	timeskip_cut(lo, false);
-+	lo->ts_cache = false;
-+	lo->ts_fail = 0;
-+	atomic64_set(&lo->ts_failed, 0);
-+	timeskip_unbad(lo);
 +}
 +
  static int do_req_filebacked(struct loop_device *lo, struct request *rq)
@@ -830,7 +822,7 @@
  	case REQ_OP_WRITE_ZEROES:
  		/*
  		 * If the caller doesn't want deallocation, call zeroout to
-@@ -691,6 +919,75 @@
+@@ -691,6 +911,61 @@
  LOOP_ATTR_RO(partscan);
  LOOP_ATTR_RO(dio);
  
@@ -868,25 +860,11 @@
 +			  atomic64_read(&dev_to_lo(dev)->ts_failed));
 +}
 +
-+static ssize_t timeskip_cache_show(struct device *dev,
-+				   struct device_attribute *attr, char *buf)
-+{
-+	return sysfs_emit(buf, "%d\n", READ_ONCE(dev_to_lo(dev)->ts_cache));
-+}
-+
 +static ssize_t timeskip_cache_store(struct device *dev,
 +				    struct device_attribute *attr,
 +				    const char *buf, size_t count)
 +{
-+	struct loop_device *lo = dev_to_lo(dev);
-+	bool v;
-+	int err = kstrtobool(buf, &v);
-+
-+	if (err)
-+		return err;
-+	WRITE_ONCE(lo->ts_cache, v);
-+	if (!v)
-+		timeskip_cut(lo, false);
++	WRITE_ONCE(dev_to_lo(dev)->ts_cache, true);
 +	return count;
 +}
 +
@@ -894,19 +872,19 @@
 +				  struct device_attribute *attr,
 +				  const char *buf, size_t count)
 +{
-+	timeskip_cut(dev_to_lo(dev), true);
++	timeskip_cut(dev_to_lo(dev));
 +	return count;
 +}
 +
 +static DEVICE_ATTR_RW(timeskip_fail);
 +static DEVICE_ATTR_RO(timeskip_failed);
-+static DEVICE_ATTR_RW(timeskip_cache);
++static DEVICE_ATTR_WO(timeskip_cache);
 +static DEVICE_ATTR_WO(timeskip_cut);
 +
  static struct attribute *loop_attrs[] = {
  	&loop_attr_backing_file.attr,
  	&loop_attr_offset.attr,
-@@ -698,6 +995,10 @@
+@@ -698,6 +973,10 @@
  	&loop_attr_autoclear.attr,
  	&loop_attr_partscan.attr,
  	&loop_attr_dio.attr,
@@ -917,7 +895,7 @@
  	NULL,
  };
  
-@@ -948,6 +1249,12 @@
+@@ -948,6 +1227,12 @@
  	lim->physical_block_size = bsize;
  	lim->io_min = bsize;
  	lim->features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_ROTATIONAL);
@@ -930,15 +908,7 @@
  	if (file->f_op->fsync && !(lo->lo_flags & LO_FLAGS_READ_ONLY))
  		lim->features |= BLK_FEAT_WRITE_CACHE;
  	if (backing_bdev && !bdev_nonrot(backing_bdev))
-@@ -1111,6 +1418,7 @@
- 
- 	invalidate_disk(lo->lo_disk);
- 	loop_sysfs_exit(lo);
-+	timeskip_reset(lo);
- 	/* let user-space know about this change */
- 	kobject_uevent(&disk_to_dev(lo->lo_disk)->kobj, KOBJ_CHANGE);
- 	mapping_set_gfp_mask(filp->f_mapping, gfp);
-@@ -1974,6 +2282,9 @@
+@@ -1974,6 +2259,9 @@
  		goto out;
  	lo->worker_tree = RB_ROOT;
  	INIT_LIST_HEAD(&lo->idle_worker_list);
@@ -948,19 +918,19 @@
  	timer_setup(&lo->timer, loop_free_idle_workers_timer, TIMER_DEFERRABLE);
  	lo->lo_state = Lo_unbound;
  
---- a/fs/namei.c
-+++ b/fs/namei.c
-@@ -44,6 +44,9 @@
- #include "internal.h"
- #include "mount.h"
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -3739,4 +3739,7 @@
+ 
+ int generic_atomic_write_valid(struct kiocb *iocb, struct iov_iter *iter);
  
 +/* Disk faults the time-skip guest agent injects (drivers/block/loop.c). */
 +bool timeskip_meta_fail(struct super_block *sb);
 +
- /* [Feb-1997 T. Schoebel-Theuer]
-  * Fundamental changes in the pathname lookup mechanisms (namei)
-  * were necessary because of omirr.  The reason is that omirr needs
-@@ -3101,6 +3104,8 @@
+ #endif /* _LINUX_FS_H */
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3101,6 +3101,8 @@
  		return -ENOENT;
  	if (victim->d_flags & DCACHE_NFSFS_RENAMED)
  		return -EBUSY;
@@ -969,7 +939,7 @@
  	return 0;
  }
  
-@@ -3124,7 +3129,8 @@
+@@ -3124,7 +3126,8 @@
  	if (!fsuidgid_has_mapping(dir->i_sb, idmap))
  		return -EOVERFLOW;
  
@@ -979,7 +949,7 @@
  }
  
  // p1 != p2, both are on the same filesystem, ->s_vfs_rename_mutex is held
-@@ -3430,6 +3436,8 @@
+@@ -3430,6 +3433,8 @@
  				 MAY_WRITE | MAY_EXEC);
  	if (error)
  		return error;
@@ -990,17 +960,7 @@
  }
 --- a/fs/sync.c
 +++ b/fs/sync.c
-@@ -19,6 +19,9 @@
- #include <linux/backing-dev.h>
- #include "internal.h"
- 
-+/* Disk faults the time-skip guest agent injects (drivers/block/loop.c). */
-+bool timeskip_meta_fail(struct super_block *sb);
-+
- #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
- 			SYNC_FILE_RANGE_WAIT_AFTER)
- 
-@@ -183,6 +186,8 @@
+@@ -183,6 +183,8 @@
  
  	if (!file->f_op->fsync)
  		return -EINVAL;

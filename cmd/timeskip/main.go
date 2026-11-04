@@ -490,22 +490,12 @@ func hash(a ...any) string { return fmt.Sprintf("%x", sha256.Sum256(fmt.Append(n
 // cores is the number of CPU cores: CPUs less hardware threads that share a
 // core. A timeline's VM has one vCPU, and two of them on one core's threads
 // each take up to twice the CPU time for the same work.
+// (x86_64's SMT has two threads a core; macOS has none.)
 func cores() int {
-	n, b := runtime.NumCPU(), []byte("0")
-	if x, err := os.ReadFile("/sys/devices/system/cpu/cpu0/topology/core_cpus_list"); err == nil {
-		b = x
+	if b, _ := os.ReadFile("/sys/devices/system/cpu/smt/active"); strings.TrimSpace(string(b)) == "1" {
+		return max(1, runtime.NumCPU()/2)
 	}
-	threads := 0
-	for _, r := range strings.Split(strings.TrimSpace(string(b)), ",") {
-		lo, hi, _ := strings.Cut(r, "-")
-		a, _ := strconv.Atoi(lo)
-		z, err := strconv.Atoi(hi)
-		if err != nil {
-			z = a
-		}
-		threads += z - a + 1
-	}
-	return max(1, n/max(1, threads))
+	return runtime.NumCPU()
 }
 
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }

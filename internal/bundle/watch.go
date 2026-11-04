@@ -47,7 +47,7 @@ type Sync struct {
 // Files are the files (not directories) the rule syncs.
 func (y Sync) Files() ([]string, error) {
 	var l []string
-	err := walk(y.Path, y.Skip, func(p string, fi fs.FileInfo) {
+	err := Walk(y.Path, y.Skip, func(p string, fi fs.FileInfo) {
 		if !fi.IsDir() {
 			l = append(l, p)
 		}
@@ -55,11 +55,11 @@ func (y Sync) Files() ([]string, error) {
 	return l, err
 }
 
-// walk calls fn with root and each file and directory under it that skip
+// Walk calls fn with root and each file and directory under it that skip
 // doesn't leave out, pruning the directories it leaves out whole. (A root
 // that's a file is left out too if skip says so, as compose watch matches
 // it.)
-func walk(root string, skip func(string, bool) bool, fn func(string, fs.FileInfo)) error {
+func Walk(root string, skip func(string, bool) bool, fn func(string, fs.FileInfo)) error {
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) && p == root {
@@ -208,7 +208,7 @@ func buildInputs(name string, s service, b *buildSpec, syncs []Sync, sums *fileS
 	}
 	var errs []error
 	add := func(root string, skip func(string, bool) bool) error {
-		return walk(root, skip, func(p string, fi fs.FileInfo) {
+		return Walk(root, skip, func(p string, fi fs.FileInfo) {
 			if fi.IsDir() {
 				if !synced(p, true) {
 					fmt.Fprintf(h, "%s %o\n", p, fi.Mode())
