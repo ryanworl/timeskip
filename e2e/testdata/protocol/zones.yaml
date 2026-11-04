@@ -1,0 +1,47 @@
+# expect: 0. Nodes labeled com.timeskip.zone and com.timeskip.region are
+# in zones a and b of region r1 and zone c of region r2: some network and
+# node faults take a whole zone or region (e2e_test.go checks that their
+# targets are exactly its nodes), and what one zone sends another is
+# delayed more than what stays in it, and what one region sends another
+# more still: with the other faults stopped, the fastest of 20 round trips
+# from zone a to b is slower than within a, and from region r1 to r2
+# slower than that.
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --timelines 3 --seed 4
+x-node: &node
+  image: busybox:1.36
+  command: [sleep, "2147483647"]
+x-timeskip:
+  faults: high_availability
+  fault_gap: 1
+services:
+  a1: {<<: *node, labels: {com.timeskip.zone: a, com.timeskip.region: r1}}
+  a2: {<<: *node, labels: {com.timeskip.zone: a, com.timeskip.region: r1}}
+  b1: {<<: *node, labels: {com.timeskip.zone: b, com.timeskip.region: r1}}
+  b2: {<<: *node, labels: {com.timeskip.zone: b, com.timeskip.region: r1}}
+  c1: {<<: *node, labels: {com.timeskip.zone: c, com.timeskip.region: r2}}
+  c2: {<<: *node, labels: {com.timeskip.zone: c, com.timeskip.region: r2}}
+  workload:
+    image: busybox:1.36
+    labels: {com.timeskip.zone: a, com.timeskip.region: r1, com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle"}
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/singleton_driver_zones <<'X'
+        #!/bin/sh
+        assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+        fastest() { ping -c 20 -i 0.1 -q $$1 | sed -n 's|.*= \([0-9.]*\)/.*|\1|p'; }
+        "$$ANTITHESIS_STOP_FAULTS" 10
+        same=$$(fastest a1) cross=$$(fastest b1) far=$$(fastest c1)
+        echo "fastest round trip within zone a: $$same ms, from a to b: $$cross ms, from r1 to r2: $$far ms"
+        slower=$$(awk -v s="$$same" -v c="$$cross" 'BEGIN { print (s != "" && c > s + 0.3) ? "true" : "false" }')
+        assert always Always "round trips between zones are slower than within one" $$slower
+        slower=$$(awk -v c="$$cross" -v f="$$far" 'BEGIN { print (c != "" && f > c + 5) ? "true" : "false" }')
+        assert always Always "round trips between regions are slower than between zones" $$slower
+        sleep 40
+        X
+        chmod +x $$d/singleton_driver_zones
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

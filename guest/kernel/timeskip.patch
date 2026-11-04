@@ -1,0 +1,1011 @@
+--- a/include/linux/tick.h
++++ b/include/linux/tick.h
+@@ -126,6 +126,12 @@
+ #define TICK_DEP_MASK_RCU		(1 << TICK_DEP_BIT_RCU)
+ #define TICK_DEP_MASK_RCU_EXP		(1 << TICK_DEP_BIT_RCU_EXP)
+ 
++extern bool timeskip_idle(void);
++/* Block requests submitted and not completed yet (by the host, in real time). */
++extern atomic_t timeskip_inflight;
++static inline void timeskip_io_start(void) { atomic_inc(&timeskip_inflight); }
++static inline void timeskip_io_end(void) { atomic_dec(&timeskip_inflight); }
++
+ #ifdef CONFIG_NO_HZ_COMMON
+ extern bool tick_nohz_enabled;
+ extern bool tick_nohz_tick_stopped(void);
+--- a/kernel/time/tick-internal.h
++++ b/kernel/time/tick-internal.h
+@@ -214,3 +214,5 @@
+ #endif
+ 
+ extern ssize_t sysfs_get_uname(const char *buf, char *dst, size_t cnt);
++
++void timekeeping_skip(u64 nsecs);
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -1685,3 +1685,95 @@
+ 	tick_nohz_switch_to_nohz();
+ 	return 0;
+ }
++
++/*
++ * Idle-time skipping for isolated single-CPU systems. Enable with
++ * timeskip=1 on the kernel command line, or at runtime through
++ * /sys/module/kernel/parameters/timeskip.
++ */
++static bool timeskip_enabled __read_mostly;
++atomic_t timeskip_inflight = ATOMIC_INIT(0);
++static unsigned long timeskip_count;
++core_param(timeskip, timeskip_enabled, bool, 0644);
++core_param(timeskip_count, timeskip_count, ulong, 0444);
++
++/* Below this, a real idle period is cheaper than a skip. */
++#define TIMESKIP_MIN_NS	(20 * NSEC_PER_USEC)
++
++/**
++ * timeskip_idle - skip ahead to the next timer instead of idling
++ *
++ * Called from the idle loop with interrupts disabled, after the tick has
++ * been stopped (or retained) and the clock event device programmed for the
++ * next timer. If nothing can wake the CPU earlier, move every clock forward
++ * to that expiry and let the event fire right away.
++ *
++ * Return: true if time was skipped and the CPU should not halt.
++ */
++bool timeskip_idle(void)
++{
++	struct clock_event_device *dev;
++	ktime_t next, now;
++	s64 delta;
++
++	if (!READ_ONCE(timeskip_enabled) || num_online_cpus() != 1)
++		return false;
++	/*
++	 * An interrupt already pending (from the host: a console line, an I/O
++	 * completion) comes before any timer: take it first. (x86's sti takes
++	 * effect after the next instruction, hence the nop; arm64 needs isb.)
++	 * If it made work, don't halt.
++	 */
++	local_irq_enable();
++#ifdef CONFIG_ARM64
++	isb();
++#else
++	asm volatile("nop");
++#endif
++	local_irq_disable();
++	if (need_resched())
++		return true;
++	/*
++	 * Pending softirqs, tasks blocked on I/O and block requests in flight
++	 * can wake us before any timer. (Requests in flight need no task
++	 * waiting on them: async I/O, writeback, readahead.)
++	 */
++	if (local_softirq_pending() || atomic_read(&timeskip_inflight) ||
++	    nr_iowait_cpu(smp_processor_id()))
++		return false;
++
++	dev = __this_cpu_read(tick_cpu_device.evtdev);
++	if (!dev || !clockevent_state_oneshot(dev))
++		return false;
++	next = dev->next_event;
++	if (next == KTIME_MAX)
++		return false;
++
++	now = ktime_get();
++	delta = ktime_to_ns(ktime_sub(next, now));
++	if (delta < TIMESKIP_MIN_NS)
++		return false;
++
++	timekeeping_skip(delta);
++	timeskip_count++;
++	/*
++	 * The expiry is now in the past. Run the clock event handler here, as a
++	 * timer interrupt arriving in idle would, rather than programming the
++	 * device to fire at once: under KVM that costs a trapped TSC-deadline
++	 * write plus an injected interrupt on every skip. The handler sees a
++	 * kernel-mode register frame, like an interrupt taken in the idle loop.
++	 */
++	{
++		struct pt_regs regs = {};
++#ifdef CONFIG_ARM64
++		regs.pstate = PSR_MODE_EL1h;
++#endif
++		struct pt_regs *old_regs = set_irq_regs(&regs);
++
++		irq_enter_rcu();
++		dev->event_handler(dev);
++		irq_exit_rcu();
++		set_irq_regs(old_regs);
++	}
++	return true;
++}
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -711,6 +711,38 @@
+ }
+ 
+ /**
++ * timekeeping_skip - advance every clock by @nsecs without the clocksource moving
++ * @nsecs:	nanoseconds to skip
++ *
++ * Unlike sleep time injection, this moves CLOCK_MONOTONIC and
++ * CLOCK_MONOTONIC_RAW forward as well as CLOCK_REALTIME and CLOCK_BOOTTIME,
++ * so to the whole system the skipped interval looks like ordinary elapsed
++ * time. Offsets between the clocks do not change, so hrtimer bases need no
++ * clock_was_set() notification. The vDSO data is refreshed here, so
++ * userspace clock reads stay on the fast path.
++ */
++void timekeeping_skip(u64 nsecs)
++{
++	struct timekeeper *tk = &tk_core.timekeeper;
++	struct timespec64 ts = ns_to_timespec64(nsecs);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&timekeeper_lock, flags);
++	write_seqcount_begin(&tk_core.seq);
++
++	timekeeping_forward_now(tk);
++	tk_xtime_add(tk, &ts);
++	tk->raw_sec += ts.tv_sec;
++	tk->tkr_raw.xtime_nsec += (u64)ts.tv_nsec << tk->tkr_raw.shift;
++	tk_normalize_xtime(tk);
++
++	timekeeping_update(tk, TK_MIRROR);
++
++	write_seqcount_end(&tk_core.seq);
++	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
++}
++
++/**
+  * ktime_get_real_ts64 - Returns the time of day in a timespec64.
+  * @ts:		pointer to the timespec to be set
+  *
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -108,7 +108,7 @@
+ void __cpuidle default_idle_call(void)
+ {
+ 	instrumentation_begin();
+-	if (!current_clr_polling_and_test()) {
++	if (!current_clr_polling_and_test() && !timeskip_idle()) {
+ 		cond_tick_broadcast_enter();
+ 		trace_cpu_idle(1, smp_processor_id());
+ 		stop_critical_timings();
+--- a/include/linux/resume_user_mode.h
++++ b/include/linux/resume_user_mode.h
+@@ -58,6 +58,8 @@
+ 
+ 	mem_cgroup_handle_over_high(GFP_KERNEL);
+ 	blkcg_maybe_throttle_current();
++	if (unlikely(current->timeskip_pause_ns))
++		timeskip_pause_current();
+ 
+ 	rseq_handle_notify_resume(NULL, regs);
+ }
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1494,6 +1494,9 @@
+ 	struct mem_cgroup		*memcg_in_oom;
+ #endif
+ 
++	/* A thread pause to take on returning to userland (see timeskip_pause): */
++	unsigned int			timeskip_pause_ns;
++
+ #ifdef CONFIG_MEMCG
+ 	/* Number of pages to reclaim on returning to userland: */
+ 	unsigned int			memcg_nr_pages_over_high;
+@@ -1932,6 +1935,7 @@
+ 
+ extern int wake_up_state(struct task_struct *tsk, unsigned int state);
+ extern int wake_up_process(struct task_struct *tsk);
++extern void timeskip_pause_current(void);
+ extern void wake_up_new_task(struct task_struct *tsk);
+ 
+ #ifdef CONFIG_SMP
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5593,6 +5593,64 @@
+ #endif /* CONFIG_SCHED_DEBUG */
+ 
+ /*
++ * Thread pausing, for timeskip's faults. With timeskip_pause on, a thread
++ * in a cgroup other than the root one (in timeskip's guest, a container's)
++ * is now and then held off the CPU: at a tick while it runs (one time in 8)
++ * and as it's switched in (one in 16), for 10 us to 10 ms (as likely in
++ * each octave), from when it next returns to user mode. A generator seeded
++ * by writing timeskip_pause_seed decides. A paused thread sleeps on a
++ * timer, so a CPU with nothing else to do skips to the end of the pause
++ * (see timeskip_idle), as it would wait out a slow thread. Kernel threads
++ * and the root cgroup's processes (timeskip's guest agent, dockerd and the
++ * rest of the guest's own) are never paused. timeskip_pauses counts the
++ * pauses.
++ */
++static bool timeskip_pause_on;
++static unsigned long long timeskip_pause_rng;
++static unsigned long timeskip_pauses;
++core_param(timeskip_pause_seed, timeskip_pause_rng, ullong, 0200);
++core_param(timeskip_pauses, timeskip_pauses, ulong, 0444);
++core_param(timeskip_pause, timeskip_pause_on, bool, 0644);
++
++/* splitmix64 */
++static u64 timeskip_pause_next(void)
++{
++	u64 z = (timeskip_pause_rng += 0x9e3779b97f4a7c15ULL);
++
++	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++	return z ^ (z >> 31);
++}
++
++/* Pause p one time in odds (a power of two). With its runqueue locked. */
++static void timeskip_pause_pick(struct task_struct *p, unsigned int odds)
++{
++	unsigned int octave;
++	u64 r;
++
++	if (p->flags & (PF_KTHREAD | PF_USER_WORKER | PF_EXITING) ||
++	    p->timeskip_pause_ns || !task_dfl_cgroup(p)->level)
++		return;
++	r = timeskip_pause_next();
++	if (r & (odds - 1))
++		return;
++	octave = (r >> 32) % 10;
++	p->timeskip_pause_ns = (10000U << octave) + ((r >> 8) & 0xffffff) % (10000U << octave);
++	timeskip_pauses++;
++	set_tsk_thread_flag(p, TIF_NOTIFY_RESUME);
++}
++
++/* From resume_user_mode_work(). A signal ends the pause early. */
++void timeskip_pause_current(void)
++{
++	ktime_t t = current->timeskip_pause_ns;
++
++	current->timeskip_pause_ns = 0;
++	set_current_state(TASK_INTERRUPTIBLE);
++	schedule_hrtimeout_range(&t, 0, HRTIMER_MODE_REL);
++}
++
++/*
+  * This function gets called by the timer code, with HZ frequency.
+  * We call it with interrupts disabled.
+  */
+@@ -5619,6 +5677,8 @@
+ 	hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
+ 	update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure);
+ 	curr->sched_class->task_tick(rq, curr, 0);
++	if (unlikely(READ_ONCE(timeskip_pause_on)))
++		timeskip_pause_pick(curr, 8);
+ 	if (sched_feat(LATENCY_WARN))
+ 		resched_latency = cpu_resched_latency(rq);
+ 	calc_global_load_tick(rq);
+@@ -6719,6 +6779,9 @@
+ 
+ 		trace_sched_switch(preempt, prev, next, prev_state);
+ 
++		if (unlikely(READ_ONCE(timeskip_pause_on)))
++			timeskip_pause_pick(next, 16);
++
+ 		/* Also unlocks the rq: */
+ 		rq = context_switch(rq, prev, next, &rf);
+ 	} else {
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -136,6 +136,15 @@
+ 			if (bio->bi_status) {
+ 				set_buffer_write_io_error(bh);
+ 				buffer_io_error(bh);
++				/*
++				 * time-skip: mapped again at its next write. Its
++				 * block may still be unwritten (the conversion is
++				 * skipped on an error), and a later write to a
++				 * buffer mapped as written isn't converted: once
++				 * evicted, its data would read as zeros, though
++				 * fsync reported none.
++				 */
++				clear_buffer_mapped(bh);
+ 			}
+ 		} while ((bh = bh->b_this_page) != head);
+ 		spin_unlock_irqrestore(&head->b_uptodate_lock, flags);
+@@ -199,6 +208,14 @@
+ 			 "extents -- potential data loss!  "
+ 			 "(inode %lu, error %d)", inode->i_ino, ret);
+ 	}
++	/*
++	 * time-skip: reported to fsync, as a failed write is. (A conversion
++	 * that fails as the filesystem shuts down, or its journal aborts,
++	 * leaves the data unreadable, yet fsync, finding no transaction to
++	 * wait for, would succeed.)
++	 */
++	if (ret < 0)
++		mapping_set_error(inode->i_mapping, ret);
+ 
+ 	ext4_clear_io_unwritten_flag(io_end);
+ 	ext4_release_io_end(io_end);
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -467,6 +467,7 @@
+ static void __fuse_request_send(struct fuse_req *req)
+ {
+ 	struct fuse_iqueue *fiq = &req->fm->fc->iq;
++	int iowait;
+ 
+ 	BUG_ON(test_bit(FR_BACKGROUND, &req->flags));
+ 
+@@ -475,7 +476,13 @@
+ 	__fuse_get_request(req);
+ 	fuse_send_one(fiq, req);
+ 
++	/*
++	 * The answer is I/O in flight: count the wait as iowait, as block I/O
++	 * is, so that an idle CPU knows a completion is on its way.
++	 */
++	iowait = io_schedule_prepare();
+ 	request_wait_answer(req);
++	io_schedule_finish(iowait);
+ 	/* Pairs with smp_wmb() in fuse_request_end() */
+ 	smp_rmb();
+ }
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -250,6 +250,27 @@
+ /* Used by crng_reseed() and crng_make_state() to extract a new seed from the input pool. */
+ static void extract_entropy(void *buf, size_t len);
+ 
++/* Seeded by timeskip_seed (see below), and reseeding from a new seed. */
++static bool timeskip_seeded, timeskip_seeding;
++
++/*
++ * Once seeded, what the kernel asks for by itself (in interrupts, softirqs
++ * and kernel threads, such as on IPv6 address and multicast timers) comes
++ * from a generator of its own, keyed by the seed too: whenever such a timer
++ * fires, it doesn't change the numbers processes get.
++ */
++static struct {
++	u8 key[CHACHA_KEY_SIZE];
++	spinlock_t lock;
++} timeskip_kernel_crng = {
++	.lock = __SPIN_LOCK_UNLOCKED(timeskip_kernel_crng.lock),
++};
++
++static bool timeskip_by_kernel(void)
++{
++	return READ_ONCE(timeskip_seeded) && (!in_task() || (current->flags & PF_KTHREAD));
++}
++
+ /* This extracts a new crng key from the input pool. */
+ static void crng_reseed(struct work_struct *work)
+ {
+@@ -262,6 +283,9 @@
+ 	if (likely(system_unbound_wq))
+ 		queue_delayed_work(system_unbound_wq, &next_reseed, crng_reseed_interval());
+ 
++	/* Seeded by timeskip: only a new seed reseeds. */
++	if (READ_ONCE(timeskip_seeded) && !timeskip_seeding)
++		return;
+ 	extract_entropy(key, sizeof(key));
+ 
+ 	/*
+@@ -365,6 +389,14 @@
+ 			return;
+ 	}
+ 
++	if (timeskip_by_kernel()) {
++		spin_lock_irqsave(&timeskip_kernel_crng.lock, flags);
++		crng_fast_key_erasure(timeskip_kernel_crng.key, chacha_state,
++				      random_data, random_data_len);
++		spin_unlock_irqrestore(&timeskip_kernel_crng.lock, flags);
++		return;
++	}
++
+ 	local_lock_irqsave(&crngs.lock, flags);
+ 	crng = raw_cpu_ptr(&crngs);
+ 
+@@ -524,7 +556,7 @@
+ 										\
+ 	warn_unseeded_randomness();						\
+ 										\
+-	if  (!crng_ready()) {							\
++	if  (!crng_ready() || timeskip_by_kernel()) {				\
+ 		_get_random_bytes(&ret, sizeof(ret));				\
+ 		return ret;							\
+ 	}									\
+@@ -648,6 +680,8 @@
+ 
+ static void _mix_pool_bytes(const void *buf, size_t len)
+ {
++	if (READ_ONCE(timeskip_seeded))
++		return;
+ 	blake2s_update(&input_pool.hash, buf, len);
+ }
+ 
+@@ -680,6 +714,10 @@
+ 	size_t i, longs;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(block.rdseed);) {
++		if (READ_ONCE(timeskip_seeded)) {
++			block.rdseed[i++] = 0;
++			continue;
++		}
+ 		longs = arch_get_random_seed_longs(&block.rdseed[i], ARRAY_SIZE(block.rdseed) - i);
+ 		if (longs) {
+ 			i += longs;
+@@ -719,6 +757,48 @@
+ 	memzero_explicit(&block, sizeof(block));
+ }
+ 
++/*
++ * Writing a number to /sys/module/kernel/parameters/timeskip_seed makes the
++ * input pool a function of that seed alone and reseeds the crng from it. From
++ * then on the pool ignores every entropy source (interrupt timing, devices,
++ * the CPU's generator, the cycle counter), and only a new seed reseeds the
++ * crng: the same seed gives processes the same random numbers, as long as
++ * they ask for them in the same order (the kernel's own draws come from
++ * timeskip_kernel_crng). For timeskip's replays of a timeline; nothing that
++ * needs secrets should want it.
++ */
++static int timeskip_seed_set(const char *val, const struct kernel_param *kp)
++{
++	u8 key[BLAKE2S_HASH_SIZE];
++	unsigned long flags;
++	u64 seed;
++	int ret = kstrtou64(val, 0, &seed);
++
++	if (ret)
++		return ret;
++	if (!crng_ready())
++		return -ENODATA;
++	blake2s(key, (const u8 *)&seed, (const u8 *)"timeskip", sizeof(key), sizeof(seed), 8);
++	spin_lock_irqsave(&timeskip_kernel_crng.lock, flags);
++	blake2s(timeskip_kernel_crng.key, key, (const u8 *)"kernel", sizeof(timeskip_kernel_crng.key), sizeof(key), 6);
++	spin_unlock_irqrestore(&timeskip_kernel_crng.lock, flags);
++	spin_lock_irqsave(&input_pool.lock, flags);
++	blake2s_init_key(&input_pool.hash, BLAKE2S_HASH_SIZE, key, sizeof(key));
++	spin_unlock_irqrestore(&input_pool.lock, flags);
++	memzero_explicit(key, sizeof(key));
++	WRITE_ONCE(timeskip_seeded, true);
++	timeskip_seeding = true;
++	crng_reseed(NULL);
++	timeskip_seeding = false;
++	return 0;
++}
++
++static const struct kernel_param_ops timeskip_seed_ops = {
++	.set = timeskip_seed_set,
++};
++/* (In /sys/module/kernel/parameters, with timeskip and timeskip_count.) */
++__module_param_call("", timeskip_seed, &timeskip_seed_ops, NULL, 0200, -1, 0);
++
+ #define credit_init_bits(bits) if (!crng_ready()) _credit_init_bits(bits)
+ 
+ static void __cold _credit_init_bits(size_t bits)
+@@ -1117,6 +1197,8 @@
+ 	struct pt_regs *regs = get_irq_regs();
+ 	unsigned int new_count;
+ 
++	if (READ_ONCE(timeskip_seeded))
++		return;
+ 	fast_mix(fast_pool->pool, entropy,
+ 		 (regs ? instruction_pointer(regs) : _RET_IP_) ^ swab(irq));
+ 	new_count = ++fast_pool->count;
+--- a/include/linux/poison.h
++++ b/include/linux/poison.h
+@@ -47,7 +47,8 @@
+ #define	POISON_END	0xa5	/* end-byte of poisoning */
+ 
+ /********** arch/$ARCH/mm/init.c **********/
+-#define POISON_FREE_INITMEM	0xcc
++/* Zero, so that a time-skip save leaves out freed init memory. */
++#define POISON_FREE_INITMEM	0x00
+ 
+ /********** fs/jbd/journal.c **********/
+ #define JBD_POISON_FREE		0x5b
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1037,12 +1037,21 @@
+ 	kasan_enable_current();
+ }
+ 
++/*
++ * Zero pages as they are freed, as init_on_free does, while the time-skip
++ * guest agent sets up a system to be saved, so that the save holds no stale
++ * data in free memory. Unlike init_on_free it can be turned on and off at
++ * any time, because allocations never count on it.
++ */
++static bool timeskip_zero_free;
++core_param(timeskip_zero_free, timeskip_zero_free, bool, 0644);
++
+ __always_inline bool free_pages_prepare(struct page *page,
+ 			unsigned int order)
+ {
+ 	int bad = 0;
+ 	bool skip_kasan_poison = should_skip_kasan_poison(page);
+-	bool init = want_init_on_free();
++	bool init = want_init_on_free() || timeskip_zero_free;
+ 	bool compound = PageCompound(page);
+ 	struct folio *folio = page_folio(page);
+ 
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -17,6 +17,7 @@
+ #include <linux/numa.h>
+ #include <linux/vmalloc.h>
+ #include <uapi/linux/virtio_ring.h>
++#include <linux/tick.h>
+ 
+ #define PART_BITS 4
+ #define VQ_NAME_LEN 16
+@@ -141,6 +142,7 @@
+ {
+ 	struct scatterlist out_hdr, in_hdr, *sgs[3];
+ 	unsigned int num_out = 0, num_in = 0;
++	int err;
+ 
+ 	sg_init_one(&out_hdr, &vbr->out_hdr, sizeof(vbr->out_hdr));
+ 	sgs[num_out++] = &out_hdr;
+@@ -155,7 +157,10 @@
+ 	sg_init_one(&in_hdr, &vbr->in_hdr.status, vbr->in_hdr_len);
+ 	sgs[num_out + num_in++] = &in_hdr;
+ 
+-	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
++	err = virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
++	if (!err)
++		timeskip_io_start();
++	return err;
+ }
+ 
+ static int virtblk_setup_discard_write_zeroes_erase(struct request *req, bool unmap)
+@@ -363,6 +368,7 @@
+ 		while ((vbr = virtqueue_get_buf(vblk->vqs[qid].vq, &len)) != NULL) {
+ 			struct request *req = blk_mq_rq_from_pdu(vbr);
+ 
++			timeskip_io_end();
+ 			if (likely(!blk_should_fake_timeout(req->q)))
+ 				blk_mq_complete_request(req);
+ 			req_done = true;
+@@ -1210,6 +1216,7 @@
+ 		u8 status = virtblk_vbr_status(vbr);
+ 
+ 		found++;
++		timeskip_io_end();
+ 		if (!blk_mq_complete_request_remote(req) &&
+ 		    !blk_mq_add_to_batch(req, iob, status != VIRTIO_BLK_S_OK,
+ 					 virtblk_complete_batch))
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -35,6 +35,9 @@
+ #include <linux/uaccess.h>
+ #include <linux/blk-mq.h>
+ #include <linux/spinlock.h>
++#include <linux/hash.h>
++#include <linux/random.h>
++#include <linux/cgroup.h>
+ #include <uapi/linux/loop.h>
+ 
+ /* Possible states of device */
+@@ -76,6 +79,17 @@
+ 	struct gendisk		*lo_disk;
+ 	struct mutex		lo_mutex;
+ 	bool			idr_visible;
++
++	/* Disk faults the time-skip guest agent injects: see timeskip_fail. */
++	unsigned int		ts_fail;
++	atomic64_t		ts_failed;
++	bool			ts_cache;
++	struct mutex		ts_mutex;
++	struct list_head	ts_writes;
++	size_t			ts_bytes;
++	u64			ts_gen;
++	struct xarray		ts_bad;
++	atomic_t		ts_nbad;
+ };
+ 
+ struct loop_cmd {
+@@ -417,14 +431,228 @@
+ 	return -EIOCBQUEUED;
+ }
+ 
++/*
++ * A node's disk, for the time-skip guest agent, is a loop device with faults
++ * of its own (in sysfs, under loop/):
++ *
++ * - timeskip_fail: the parts per million of its data's reads and writes to
++ *   fail with EIO, as a failing disk's, and of the metadata operations on
++ *   its filesystem (see timeskip_meta_fail); timeskip_failed counts them.
++ *   A read that fails leaves a 4 KiB block of it bad, as a latent sector
++ *   error does: reads of it fail until it's written (and so remapped) or
++ *   timeskip_fail is written again (TIMESKIP_BAD blocks at most).
++ *   Not its filesystem's own metadata I/O (REQ_META, as the journal's
++ *   writes are, or in the block device's page cache): a failing disk's
++ *   errors stay the systems' to handle, not a broken filesystem's.
++ * - timeskip_cache: a volatile write cache. The writes since the last flush
++ *   are kept (their blocks' old contents are), and writing timeskip_cut, as
++ *   the power is cut (with nothing mounted), loses each 4 KiB block of them
++ *   with probability one half: it reads as it did before them. A disk's
++ *   cache holds TIMESKIP_CACHE bytes at most: older writes are durable.
++ */
++#define TIMESKIP_CACHE (64 << 20)
++#define TIMESKIP_BAD 4096
++
++struct timeskip_write {
++	struct list_head	list;
++	u64			gen;	/* the flushes begun before it */
++	loff_t			pos;
++	size_t			len;
++	char			old[];
++};
++
++static bool timeskip_fail(struct loop_device *lo, struct request *rq)
++{
++	unsigned int ppm = READ_ONCE(lo->ts_fail);
++	bool read = req_op(rq) == REQ_OP_READ, fail;
++	unsigned long b, first, last;
++	struct address_space *m;
++	struct bio *bio;
++
++	if (!ppm || !rq->bio)
++		return false;
++	first = blk_rq_pos(rq) >> 3;
++	last = (blk_rq_pos(rq) + blk_rq_sectors(rq) - 1) >> 3;
++	if (req_op(rq) == REQ_OP_WRITE_ZEROES) { /* (bad blocks written) */
++		for (b = first; !xa_empty(&lo->ts_bad) && b <= last; b++)
++			if (xa_erase(&lo->ts_bad, b))
++				atomic_dec(&lo->ts_nbad);
++		return false;
++	}
++	if (!read && req_op(rq) != REQ_OP_WRITE)
++		return false;
++	/* (Any of its bios: a request merges the filesystem's with data's.) */
++	__rq_for_each_bio(bio, rq) {
++		if (bio->bi_opf & REQ_META)
++			return false;
++		m = folio_mapping(page_folio(bio_first_page_all(bio)));
++		if (m && S_ISBLK(m->host->i_mode))
++			return false;
++	}
++	fail = get_random_u32_below(1000000) < ppm;
++	if (read && fail && atomic_read(&lo->ts_nbad) < TIMESKIP_BAD) {
++		b = first + get_random_u32_below(last - first + 1);
++		if (!xa_insert(&lo->ts_bad, b, xa_mk_value(1), GFP_NOIO))
++			atomic_inc(&lo->ts_nbad);
++	}
++	for (b = first; !xa_empty(&lo->ts_bad) && !fail && b <= last; b++) {
++		if (read)
++			fail = xa_load(&lo->ts_bad, b);
++		else if (xa_erase(&lo->ts_bad, b))
++			atomic_dec(&lo->ts_nbad);
++	}
++	if (fail)
++		atomic64_inc(&lo->ts_failed);
++	return fail;
++}
++
++/* No block is bad any more. */
++static void timeskip_unbad(struct loop_device *lo)
++{
++	xa_destroy(&lo->ts_bad);
++	atomic_set(&lo->ts_nbad, 0);
++}
++
++/*
++ * Whether to fail a metadata operation on a filesystem on a node's disk,
++ * with EIO, as timeskip_fail fails its data's reads and writes: creating,
++ * removing or renaming a file, or fsyncing a directory (see fs/namei.c and
++ * fs/sync.c). It fails before it changes anything: the filesystem stays
++ * whole, and the caller sees the error a failing disk's would give it.
++ */
++bool timeskip_meta_fail(struct super_block *sb)
++{
++	struct loop_device *lo;
++	unsigned int ppm;
++	bool guest;
++
++	if (!sb->s_bdev || sb->s_bdev->bd_disk->major != LOOP_MAJOR)
++		return false;
++	/*
++	 * (Not the guest's own, in the root cgroup: Docker's, as it mounts a
++	 * container's overlay, which would come up read-only.)
++	 */
++	rcu_read_lock();
++	guest = !task_dfl_cgroup(current)->level;
++	rcu_read_unlock();
++	if (guest)
++		return false;
++	lo = sb->s_bdev->bd_disk->private_data;
++	ppm = READ_ONCE(lo->ts_fail);
++	if (!ppm || get_random_u32_below(1000000) >= ppm)
++		return false;
++	atomic64_inc(&lo->ts_failed);
++	return true;
++}
++
++static void timeskip_drop(struct loop_device *lo, struct timeskip_write *w)
++{
++	list_del(&w->list);
++	lo->ts_bytes -= w->len;
++	kvfree(w);
++}
++
++/* Keep what a write of len bytes at pos is about to overwrite. */
++static void timeskip_record(struct loop_device *lo, loff_t pos, size_t len)
++{
++	struct timeskip_write *w;
++	loff_t p = pos;
++	ssize_t n;
++
++	if (!READ_ONCE(lo->ts_cache) || len > TIMESKIP_CACHE)
++		return;
++	w = kvmalloc(struct_size(w, old, len), GFP_NOIO);
++	if (!w)
++		return; /* (it's durable) */
++	n = kernel_read(lo->lo_backing_file, w->old, len, &p);
++	if (n < 0) {
++		kvfree(w);
++		return;
++	}
++	memset(w->old + n, 0, len - n); /* (past the end of the file) */
++	w->pos = pos;
++	w->len = len;
++	mutex_lock(&lo->ts_mutex);
++	w->gen = lo->ts_gen;
++	list_add_tail(&w->list, &lo->ts_writes);
++	lo->ts_bytes += len;
++	while (lo->ts_bytes > TIMESKIP_CACHE)
++		timeskip_drop(lo, list_first_entry(&lo->ts_writes,
++						   struct timeskip_write, list));
++	mutex_unlock(&lo->ts_mutex);
++}
++
++/* A flush makes the writes recorded before it began durable. */
++static int timeskip_flush(struct loop_device *lo, struct request *rq)
++{
++	struct timeskip_write *w, *t;
++	u64 gen;
++	int ret;
++
++	mutex_lock(&lo->ts_mutex);
++	gen = lo->ts_gen++;
++	mutex_unlock(&lo->ts_mutex);
++	ret = lo_req_flush(lo, rq);
++	if (ret)
++		return ret;
++	mutex_lock(&lo->ts_mutex);
++	list_for_each_entry_safe(w, t, &lo->ts_writes, list)
++		if (w->gen <= gen)
++			timeskip_drop(lo, w);
++	mutex_unlock(&lo->ts_mutex);
++	return 0;
++}
++
++/*
++ * Lose each 4 KiB block of the writes since the last flush with probability
++ * one half (or, if !cut, none): the newest first, so that a block lost reads
++ * as it did before them all.
++ */
++static void timeskip_cut(struct loop_device *lo, bool cut)
++{
++	struct timeskip_write *w, *t;
++	u64 salt = get_random_u64();
++
++	mutex_lock(&lo->ts_mutex);
++	list_for_each_entry_safe_reverse(w, t, &lo->ts_writes, list) {
++		loff_t p = w->pos;
++
++		while (cut && p < w->pos + w->len) {
++			loff_t end = min_t(loff_t, round_down(p, 4096) + 4096,
++					   w->pos + w->len), q = p;
++
++			if (hash_64((p >> 12) ^ salt, 1))
++				kernel_write(lo->lo_backing_file,
++					     w->old + (p - w->pos), end - p, &q);
++			p = end;
++		}
++		timeskip_drop(lo, w);
++	}
++	mutex_unlock(&lo->ts_mutex);
++}
++
++static void timeskip_reset(struct loop_device *lo)
++{
++	timeskip_cut(lo, false);
++	lo->ts_cache = false;
++	lo->ts_fail = 0;
++	atomic64_set(&lo->ts_failed, 0);
++	timeskip_unbad(lo);
++}
++
+ static int do_req_filebacked(struct loop_device *lo, struct request *rq)
+ {
+ 	struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
+ 	loff_t pos = ((loff_t) blk_rq_pos(rq) << 9) + lo->lo_offset;
+ 
++	if (timeskip_fail(lo, rq))
++		return -EIO;
++	if (op_is_write(req_op(rq)) && req_op(rq) != REQ_OP_FLUSH)
++		timeskip_record(lo, pos, blk_rq_bytes(rq));
++
+ 	switch (req_op(rq)) {
+ 	case REQ_OP_FLUSH:
+-		return lo_req_flush(lo, rq);
++		return timeskip_flush(lo, rq);
+ 	case REQ_OP_WRITE_ZEROES:
+ 		/*
+ 		 * If the caller doesn't want deallocation, call zeroout to
+@@ -691,6 +919,75 @@
+ LOOP_ATTR_RO(partscan);
+ LOOP_ATTR_RO(dio);
+ 
++static struct loop_device *dev_to_lo(struct device *dev)
++{
++	return dev_to_disk(dev)->private_data;
++}
++
++static ssize_t timeskip_fail_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", READ_ONCE(dev_to_lo(dev)->ts_fail));
++}
++
++static ssize_t timeskip_fail_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	unsigned int v;
++	int err = kstrtouint(buf, 0, &v);
++
++	if (err)
++		return err;
++	if (v > 1000000)
++		return -EINVAL;
++	WRITE_ONCE(dev_to_lo(dev)->ts_fail, v);
++	timeskip_unbad(dev_to_lo(dev));
++	return count;
++}
++
++static ssize_t timeskip_failed_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lld\n",
++			  atomic64_read(&dev_to_lo(dev)->ts_failed));
++}
++
++static ssize_t timeskip_cache_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", READ_ONCE(dev_to_lo(dev)->ts_cache));
++}
++
++static ssize_t timeskip_cache_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct loop_device *lo = dev_to_lo(dev);
++	bool v;
++	int err = kstrtobool(buf, &v);
++
++	if (err)
++		return err;
++	WRITE_ONCE(lo->ts_cache, v);
++	if (!v)
++		timeskip_cut(lo, false);
++	return count;
++}
++
++static ssize_t timeskip_cut_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	timeskip_cut(dev_to_lo(dev), true);
++	return count;
++}
++
++static DEVICE_ATTR_RW(timeskip_fail);
++static DEVICE_ATTR_RO(timeskip_failed);
++static DEVICE_ATTR_RW(timeskip_cache);
++static DEVICE_ATTR_WO(timeskip_cut);
++
+ static struct attribute *loop_attrs[] = {
+ 	&loop_attr_backing_file.attr,
+ 	&loop_attr_offset.attr,
+@@ -698,6 +995,10 @@
+ 	&loop_attr_autoclear.attr,
+ 	&loop_attr_partscan.attr,
+ 	&loop_attr_dio.attr,
++	&dev_attr_timeskip_fail.attr,
++	&dev_attr_timeskip_failed.attr,
++	&dev_attr_timeskip_cache.attr,
++	&dev_attr_timeskip_cut.attr,
+ 	NULL,
+ };
+ 
+@@ -948,6 +1249,12 @@
+ 	lim->physical_block_size = bsize;
+ 	lim->io_min = bsize;
+ 	lim->features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_ROTATIONAL);
++	/*
++	 * (timeskip: a page isn't changed while it's written, so that a
++	 * failed write (see timeskip_fail) fails only what it held, and a
++	 * write meanwhile, mapped again, isn't lost with it.)
++	 */
++	lim->features |= BLK_FEAT_STABLE_WRITES;
+ 	if (file->f_op->fsync && !(lo->lo_flags & LO_FLAGS_READ_ONLY))
+ 		lim->features |= BLK_FEAT_WRITE_CACHE;
+ 	if (backing_bdev && !bdev_nonrot(backing_bdev))
+@@ -1111,6 +1418,7 @@
+ 
+ 	invalidate_disk(lo->lo_disk);
+ 	loop_sysfs_exit(lo);
++	timeskip_reset(lo);
+ 	/* let user-space know about this change */
+ 	kobject_uevent(&disk_to_dev(lo->lo_disk)->kobj, KOBJ_CHANGE);
+ 	mapping_set_gfp_mask(filp->f_mapping, gfp);
+@@ -1974,6 +2282,9 @@
+ 		goto out;
+ 	lo->worker_tree = RB_ROOT;
+ 	INIT_LIST_HEAD(&lo->idle_worker_list);
++	mutex_init(&lo->ts_mutex);
++	INIT_LIST_HEAD(&lo->ts_writes);
++	xa_init(&lo->ts_bad);
+ 	timer_setup(&lo->timer, loop_free_idle_workers_timer, TIMER_DEFERRABLE);
+ 	lo->lo_state = Lo_unbound;
+ 
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -44,6 +44,9 @@
+ #include "internal.h"
+ #include "mount.h"
+ 
++/* Disk faults the time-skip guest agent injects (drivers/block/loop.c). */
++bool timeskip_meta_fail(struct super_block *sb);
++
+ /* [Feb-1997 T. Schoebel-Theuer]
+  * Fundamental changes in the pathname lookup mechanisms (namei)
+  * were necessary because of omirr.  The reason is that omirr needs
+@@ -3101,6 +3104,8 @@
+ 		return -ENOENT;
+ 	if (victim->d_flags & DCACHE_NFSFS_RENAMED)
+ 		return -EBUSY;
++	if (timeskip_meta_fail(dir->i_sb))
++		return -EIO;
+ 	return 0;
+ }
+ 
+@@ -3124,7 +3129,8 @@
+ 	if (!fsuidgid_has_mapping(dir->i_sb, idmap))
+ 		return -EOVERFLOW;
+ 
+-	return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
++	return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC) ?:
++	       (timeskip_meta_fail(dir->i_sb) ? -EIO : 0);
+ }
+ 
+ // p1 != p2, both are on the same filesystem, ->s_vfs_rename_mutex is held
+@@ -3430,6 +3436,8 @@
+ 				 MAY_WRITE | MAY_EXEC);
+ 	if (error)
+ 		return error;
++	if (timeskip_meta_fail(dir->dentry->d_sb))
++		return -EIO;
+ 
+ 	return security_inode_create(dir->dentry->d_inode, dentry, mode);
+ }
+--- a/fs/sync.c
++++ b/fs/sync.c
+@@ -19,6 +19,9 @@
+ #include <linux/backing-dev.h>
+ #include "internal.h"
+ 
++/* Disk faults the time-skip guest agent injects (drivers/block/loop.c). */
++bool timeskip_meta_fail(struct super_block *sb);
++
+ #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
+ 			SYNC_FILE_RANGE_WAIT_AFTER)
+ 
+@@ -183,6 +186,8 @@
+ 
+ 	if (!file->f_op->fsync)
+ 		return -EINVAL;
++	if (S_ISDIR(inode->i_mode) && timeskip_meta_fail(inode->i_sb))
++		return -EIO;
+ 	if (!datasync && (inode->i_state & I_DIRTY_TIME))
+ 		mark_inode_dirty_sync(inode);
+ 	return file->f_op->fsync(file, start, end, datasync);

@@ -1,0 +1,115 @@
+# expect: 0. With --disk-faults=power, half the kills are power losses:
+# the node's disk loses what it never flushed, data and metadata, as a
+# real disk does. writer creates and appends files in its volume and its
+# layer without syncing them, for half a second at a time, then writes and
+# syncs a file and a line of its log; when a fault's heal starts it again,
+# it checks the files its log lists. A file it synced always survives; one
+# it didn't is sometimes gone (its creation wasn't committed) or short,
+# and holds only what was written to it, or zeros. spared, labeled
+# com.antithesis.exclude_from_faults with "kill", writes without syncing
+# and never loses a write, not even in a volume it shares with writer,
+# which is on a disk no fault touches.
+# args: --timelines 16 --seed 3
+x-lib: &lib |
+  assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+  yes abcdefg | head -c 16384 > /tmp/pat
+  # (A file's state: full, gone, short (a prefix), zeros (what was written,
+  # with zeros in place of some of it) or bad. Every 4 KiB of the pattern
+  # is the same: a file of whole such blocks and blocks of zeros is a
+  # prefix of it once its zeros are taken out.)
+  state() {
+    [ -e $$1 ] || { echo gone; return; }
+    n=$$(wc -c < $$1)
+    tr -d '\0' < $$1 > /tmp/nz
+    z=$$(wc -c < /tmp/nz)
+    if ! head -c $$z /tmp/pat | cmp -s - /tmp/nz; then echo bad
+    elif [ $$z != $$n ]; then echo zeros
+    elif [ $$n = 16384 ]; then echo full
+    else echo short
+    fi
+  }
+  append() { for k in 1 2 3 4; do head -c 4096 /tmp/pat >> $$1; done; }
+  # (busybox's sync FILE syncs every filesystem: dd conv=fsync syncs a file.)
+x-timeskip:
+  faults: high_availability
+  disk_faults: [power]
+  fault_gap: 1
+services:
+  writer:
+    image: busybox:1.36
+    environment: {LIB: *lib}
+    volumes: [data:/data, shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        if [ -s /data/log ]; then
+          full=0 gone=0 short=0 zeros=0 bad=0
+          for i in $$(cat /data/log); do
+            assert always Always "a synced write survives a power loss" $$([ $$(state /data/s$$i) = full ] && echo true || echo false)
+            for f in /data/u$$i-1 /data/u$$i-2 /data/u$$i-3 /var/u$$i-1 /var/u$$i-2 /var/u$$i-3; do
+              st=$$(state $$f)
+              case $$st in
+                full) full=$$((full + 1)) ;; gone) gone=$$((gone + 1)) ;; short) short=$$((short + 1)) ;;
+                zeros) zeros=$$((zeros + 1)) ;; *) bad=$$((bad + 1)) ;;
+              esac
+            done
+          done
+          echo "unsynced files after a restart: full $$full, gone $$gone, short $$short, zero-filled $$zeros, bad $$bad"
+          assert always Always "an unsynced file holds what was written to it, or zeros" $$([ $$bad = 0 ] && echo true || echo false)
+          assert sometimes Sometimes "a power loss loses an unsynced write" $$([ $$((short + zeros)) -gt 0 ] && echo true || echo false)
+          assert sometimes Sometimes "a power loss loses a file created since the journal's last commit" $$([ $$gone -gt 0 ] && echo true || echo false)
+        fi
+        # (The log first: a stop or kill can come between the two.)
+        : | dd of=/data/log conv=fsync status=none
+        rm -f /data/u* /data/s* /var/u*
+        i=0
+        while :; do
+          i=$$((i + 1))
+          dd if=/tmp/pat of=/data/s$$i conv=fsync status=none
+          echo $$i | dd of=/data/log oflag=append conv=notrunc,fsync status=none
+          # (Then files that no fsync commits, until the next one's: made
+          # at once, then filled.)
+          touch /data/u$$i-1 /data/u$$i-2 /data/u$$i-3 /var/u$$i-1 /var/u$$i-2 /var/u$$i-3
+          for k in 1 2 3; do append /data/u$$i-$$k && append /var/u$$i-$$k && sleep 0.15; done
+        done
+  spared:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "kill"}
+    environment: {LIB: *lib}
+    volumes: [kept:/kept, shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        # (A stop can interrupt a file: /kept/done lists those it finished.)
+        while :; do
+          for i in $$(cat /kept/done 2> /dev/null); do
+            for f in /kept/u$$i /var/u$$i /shared/u$$i; do
+              assert always Always "a container excluded from kills loses no write" $$([ $$(state $$f) = full ] && echo true || echo false)
+            done
+          done
+          rm -f /kept/done && rm -f /kept/u* /var/u* /shared/u*
+          for i in $$(seq 20); do
+            append /kept/u$$i && append /var/u$$i && append /shared/u$$i && echo $$i >> /kept/done
+            sleep 0.05
+          done
+        done
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        printf '#!/bin/sh\nsleep 30\n' > $$d/singleton_driver_wait
+        chmod +x $$d/singleton_driver_wait
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
+volumes:
+  data:
+  kept:
+  shared:

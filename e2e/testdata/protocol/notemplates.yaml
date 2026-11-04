@@ -1,0 +1,19 @@
+# expect: 1. A project without test templates, whose workload runs as its
+# entrypoint, as Antithesis allows: a timeline is --timeout of it, and its
+# assertions decide. This one's Sometimes assertion is never true.
+# fails: the workload finished early
+x-timeskip:
+  timeout: 20
+services:
+  workload:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        o=$$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$o
+        sleep 5
+        echo '{"antithesis_assert": {"id": "the workload ran", "message": "the workload ran", "assert_type": "always", "display_type": "Always", "condition": true, "hit": true, "must_hit": true}}' >> $$o
+        echo '{"antithesis_assert": {"id": "the workload finished early", "message": "the workload finished early", "assert_type": "sometimes", "display_type": "Sometimes", "condition": false, "hit": true, "must_hit": true}}' >> $$o
+        exec sleep 2147483647

@@ -1,0 +1,18 @@
+# expect: 1. When the VM runs out of memory (past Antithesis's "Peak memory
+# usage" bound) and the kernel kills a process, the timeline fails, even
+# when the command whose process it was exits 0.
+# errors: crash: the VM ran out of memory and killed process \d+ \(sort\)
+x-timeskip:
+  memory: 1
+services:
+  workload:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        printf '#!/bin/sh\nyes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 1500m | sort > /dev/null\nexit 0\n' > $$d/singleton_driver_hog
+        chmod +x $$d/singleton_driver_hog
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

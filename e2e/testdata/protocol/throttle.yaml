@@ -1,0 +1,63 @@
+# expect: 0. With resilient faults, a container that's throttled (to 5% to
+# 50% of a CPU, its cpu.max) does measurably less work per guest second:
+# a CPU-bound chunk of work takes longer in guest time than the CPU time
+# it uses, as the time it waits for its next period passes (skipped);
+# sometimes much longer than before faults; and the CPU time stays within
+# its quota. (Not always: the host can take the vCPU from it, which counts
+# as CPU time, and as guest time, before faults too.)
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --timelines 4 --seed 11
+x-timeskip:
+  faults: resilient
+  fault_gap: 2
+services:
+  workload:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/helper_work <<'X'
+        assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+        ms() { awk '{print int($$1 * 1000)}' /proc/uptime; }
+        usage() { awk '$$1 == "usage_usec" {print $$2}' /sys/fs/cgroup/cpu.stat; }
+        chunk() { t=$$(ms); awk -v k="$$1" 'BEGIN { for (i = 0; i < k; i++) s += i }'; echo $$(($$(ms) - t)); }
+        X
+        cat > $$d/first_calibrate <<'X'
+        #!/bin/sh
+        # A chunk of work that takes at least 200 ms unthrottled, and the
+        # least it takes.
+        . /opt/antithesis/test/v1/t/helper_work
+        k=100000
+        until [ $$(chunk $$k) -ge 200 ]; do k=$$((k * 2)); done
+        base=$$(chunk $$k)
+        for i in 1 2; do t=$$(chunk $$k); [ $$t -lt $$base ] && base=$$t; done
+        echo "a chunk is $$k additions: $$base ms"
+        echo "$$k $$base" > /tmp/calibration
+        X
+        cat > $$d/singleton_driver_work <<'X'
+        #!/bin/sh
+        . /opt/antithesis/test/v1/t/helper_work
+        read k base < /tmp/calibration
+        for i in $$(seq 30); do
+          q0=$$(cat /sys/fs/cgroup/cpu.max); u0=$$(usage)
+          t=$$(chunk $$k)
+          u=$$(($$(usage) - u0)); q1=$$(cat /sys/fs/cgroup/cpu.max)
+          case $$q0 in max*) continue;; esac
+          [ "$$q0" = "$$q1" ] || continue
+          set -- $$q0
+          echo "throttled to $$1/$$2: a chunk took $$t ms (unthrottled $$base ms) and $$((u / 1000)) ms of CPU"
+          # (At most the quota per period, give or take the quota at each end
+          # and a tick or two of overrun.)
+          assert sometimes Sometimes "a throttled container uses at most its quota of CPU per guest second" \
+            $$(awk -v u=$$u -v t=$$t -v q=$$1 -v p=$$2 'BEGIN { print (u <= t * 1000 * q / p + 2 * q + 10000) ? "true" : "false" }')
+          assert always Always "a throttled container waits: its work takes longer than the CPU time it uses" \
+            $$([ $$((t * 1000)) -gt $$((u * 6 / 5)) ] && echo true || echo false)
+          assert sometimes Sometimes "a throttled container does at most 60% of its unthrottled work per guest second" \
+            $$([ $$((base * 100)) -le $$((t * 60)) ] && echo true || echo false)
+        done
+        X
+        chmod +x $$d/first_calibrate $$d/singleton_driver_work
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

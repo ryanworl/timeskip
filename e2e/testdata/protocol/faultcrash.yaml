@@ -1,0 +1,49 @@
+# expect: 1. With node faults, a service crashes (exits 1) once and its
+# restart policy restarts it; node faults then stop it (after the crash it
+# exits 3 on SIGTERM) or kill it (137), which don't count, as in
+# Antithesis, and start it again. (Before the crash it doesn't catch
+# SIGTERM, so that a crash racing a stop still counts: then only a 143 can
+# be the stop's.) The crash fails the timeline, and nothing else does. The driver
+# runs until a heal has started the service after its crash restart (or
+# 60 s), since how many node faults come after the crash depends on the
+# host's load.
+# errors: containers: \S*crashy\S* exited with code 1
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --seed 4
+volumes: {shared: {}}
+x-timeskip:
+  faults: high_availability
+  fault_gap: 1
+services:
+  crashy:
+    image: busybox:1.36
+    restart: on-failure
+    volumes: [shared:/shared]
+    command: [sh, -c, "echo boot >> /shared/boots; until [ -f /shared/crash ]; do sleep 0.2; done; [ -f /crashed ] || { touch /crashed; echo crash >> /shared/boots; exit 1; }; trap 'exit 3' TERM; sleep 2147483647 & wait"]
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    volumes: [shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        # (The boots after the crash: by the restart policy, then by heals.)
+        cat > /bin/restarts <<'X'
+        #!/bin/sh
+        awk '/crash/ { c = 1; n = 0; next } c && /boot/ { n++ } END { print n + 0 }' /shared/boots
+        X
+        cat > $$d/singleton_driver_x <<'X'
+        #!/bin/sh
+        sleep 1; touch /shared/crash
+        i=0; until [ $$(restarts) -ge 2 ] || [ $$i -ge 300 ]; do sleep 0.2; i=$$((i + 1)); done
+        X
+        cat > $$d/finally_started <<'X'
+        #!/bin/sh
+        n=$$(restarts)
+        echo "{\"antithesis_assert\": {\"assert_type\": \"always\", \"display_type\": \"Always\", \"message\": \"a heal started crashy again after its crash restart\", \"condition\": $$([ $$n -ge 2 ] && echo true || echo false), \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        X
+        chmod +x /bin/restarts $$d/singleton_driver_x $$d/finally_started
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

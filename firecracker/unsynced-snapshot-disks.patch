@@ -1,0 +1,20 @@
+--- a/src/vmm/src/devices/virtio/block/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/device.rs
+@@ -748,7 +748,16 @@
+             return;
+         }
+ 
+-        self.drain_and_flush(false);
++        // A disk whose cache is Unsafe isn't synced for a snapshot either, as
++        // when it's dropped: the guest's writes are in the host's page cache.
++        match self.cache_type {
++            CacheType::Unsafe => {
++                if let Err(err) = self.disk.file_engine.drain(false) {
++                    error!("Failed to drain ops: {:?}", err);
++                }
++            }
++            CacheType::Writeback => self.drain_and_flush(false),
++        }
+         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
+             self.process_async_completion_queue();
+         }

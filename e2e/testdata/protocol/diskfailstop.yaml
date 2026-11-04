@@ -1,0 +1,63 @@
+# expect: 0. A container that exits on a failed write (as many systems do,
+# failing stop) is started again as the failing disk heals, as a stopped
+# or killed one is, and its exit isn't an unexpected one. One that holds
+# on to the error instead, and stops serving, is rebooted with its node
+# when the fault reboots (half the time), else left so; the writes that
+# failed in a file it held open (never synced but by sync(1), so their
+# errors went unreported) don't fail its next run's fsync of the file, as
+# after a reboot. Each counts its starts in a file and serves the count:
+# after the faults, the one that exits answers, and was started more than
+# once; the holder sometimes answers, started again, and sometimes not.
+# args: --timelines 8 --seed 7
+x-timeskip:
+  faults: legacy
+  disk_faults: [fail]
+  fault_gap: 2
+services:
+  failstop:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network"}
+    command:
+      - sh
+      - -c
+      - |
+        n=$$(($$(cat /var/n 2> /dev/null || echo 0) + 1)); echo $$n > /var/n; sync
+        mkdir -p /www && echo $$n > /www/n && httpd -p 8080 -h /www
+        while dd if=/dev/zero of=/var/f bs=64k count=4 conv=fsync 2> /dev/null; do sleep 0.2; done
+        echo "a write failed: exiting"; exit 1
+  holder:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network"}
+    command:
+      - sh
+      - -c
+      - |
+        dd if=/dev/null of=/var/held conv=notrunc,fsync 2> /dev/null || { echo "an earlier run's write error: exiting"; exit 1; }
+        n=$$(($$(cat /var/n 2> /dev/null || echo 0) + 1)); echo $$n > /var/n; sync
+        mkdir -p /www && echo $$n > /www/n && httpd -f -p 8080 -h /www & h=$$!
+        exec 3>> /var/held
+        while head -c 262144 /dev/zero >&3 && sync && dd if=/dev/zero of=/var/f bs=64k count=4 conv=fsync 2> /dev/null; do sleep 0.2; done
+        echo "a write failed: no more answers until a restart"; kill $$h; exec sleep 2147483647
+  workload:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network,disk"}
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        printf '#!/bin/sh\nsleep 20\n' > $$d/singleton_driver_wait
+        cat > $$d/finally_check <<'X'
+        #!/bin/sh
+        assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+        get() { n=; for i in $$(seq 50); do n=$$(wget -q -T 1 -O - http://$$1:8080/n) && break; sleep 0.2; done; echo "$$1 started $$n times"; }
+        get failstop
+        assert always Always "failstop: a container that stopped on a failed write answers after faults" $$([ -n "$$n" ] && echo true || echo false)
+        assert sometimes Sometimes "failstop: a container stopped on a failed write and was started again" $$([ "$$n" -gt 1 ] 2> /dev/null && echo true || echo false)
+        get holder
+        assert sometimes Sometimes "holder: rebooted after a failed write, it answers again" $$([ "$$n" -gt 1 ] 2> /dev/null && echo true || echo false)
+        assert sometimes Sometimes "holder: not rebooted after a failed write, it holds on to the error" $$([ -z "$$n" ] && echo true || echo false)
+        X
+        chmod +x $$d/singleton_driver_wait $$d/finally_check
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

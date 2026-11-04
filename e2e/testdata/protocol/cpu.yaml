@@ -1,0 +1,29 @@
+# expect: 0. Each command's CPU time (its own and what it waited for) and
+# each container's (its cgroup's): a driver spins for 1 s of guest time in
+# a child process and reports the kernel's account of the child's CPU time
+# (its cutime and cstime, in its output), a finally_ command
+# sleeps 1 s, and another container only sleeps. e2e_test.go checks cpu_ms
+# and container_cpu_ms against the child's account, not the guest second,
+# which a loaded host makes more or less CPU time.
+services:
+  idle:
+    image: busybox:1.36
+    command: [sleep, "2147483647"]
+  workload:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/singleton_driver_spin <<'X'
+        #!/bin/sh
+        ms() { read -r up _ < /proc/uptime; echo $$(($${up%.*} * 1000 + 1$${up#*.} * 10 - 1000)); }
+        (end=$$(($$(ms) + 1000)); while [ $$(ms) -lt $$end ]; do :; done)
+        set -- $$(cut -d' ' -f16,17 /proc/$$$$/stat)
+        echo "the child's CPU time: $$((($$1 + $$2) * 10)) ms"
+        X
+        printf '#!/bin/sh\nsleep 1\n' > $$d/finally_sleep
+        chmod +x $$d/*
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

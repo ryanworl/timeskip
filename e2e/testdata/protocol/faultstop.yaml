@@ -1,0 +1,43 @@
+# expect: 0. With faults, ANTITHESIS_STOP_FAULTS 0 or 2 returns as soon as
+# the faults in effect are healed, even while a stop takes 10 s (the server
+# ignores SIGTERM): no fault waits out its time and no new one starts
+# meanwhile. (Else calls take minutes; the bound leaves room for a loaded
+# host.) The server answers right after.
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --timelines 4 --seed 11
+x-timeskip:
+  faults: high_availability
+  fault_gap: 1
+services:
+  server:
+    image: busybox:1.36
+    command: [sh, -c, "mkdir -p /www && echo ok > /www/ok && exec httpd -f -p 8080 -h /www"]
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/singleton_driver_stop <<'X'
+        #!/bin/sh
+        assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"always\", \"display_type\": \"Always\", \"message\": \"$$1\", \"condition\": $$2, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+        ms() { awk '{print int($$1 * 1000)}' /proc/uptime; }
+        for i in $$(seq 16); do
+          sleep $$((i % 3))
+          s=$$((i % 2 * 2))
+          t=$$(ms); "$$ANTITHESIS_STOP_FAULTS" $$s; t=$$(($$(ms) - t))
+          echo "ANTITHESIS_STOP_FAULTS $$s took $$t ms"
+          assert "ANTITHESIS_STOP_FAULTS returns within 60 s" $$([ $$t -lt 60000 ] && echo true || echo false)
+          if [ $$s = 2 ]; then
+            ok=false
+            for j in 1 2 3 4; do wget -q -T 1 -O /dev/null http://server:8080/ok && ok=true && break; sleep 0.1; done
+            assert "the server answers once the faults are healed" $$ok
+          fi
+        done
+        X
+        chmod +x $$d/singleton_driver_stop
+        until wget -q -T 1 -O /dev/null http://server:8080/ok; do sleep 0.2; done
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

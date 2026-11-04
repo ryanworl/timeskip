@@ -1,0 +1,24 @@
+# A lock service with leases, lockd, replicating to a standby, and clients
+# contending for one lock: the test template in client (client/test, at
+# /opt/antithesis/test/v1/lockd) runs parallel_driver_ clients that each
+# contend for ten minutes of guest time, nearly all of it asleep.
+# LOCKD_FIX=1 runs lockd with the fix (README.md).
+services:
+  lockd:
+    image: timeskip/lockd
+    build: ./lockd
+    command: [-standby=http://standby:7001, -ttl=1s]
+    environment: {LOCKD_FIX: "${LOCKD_FIX:-0}"}
+
+  standby:
+    image: timeskip/lockd
+    build: ./lockd
+    command: [-addr=:7001]
+
+  client:
+    image: timeskip/lockd-client
+    build: ./client
+    command: [setup.sh]     # writes setup_complete once lockd answers
+    init: true
+    # A stop or kill here would end every client, and the timeline with them.
+    labels: {com.antithesis.exclude_from_faults: "stop,kill"}

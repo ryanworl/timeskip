@@ -1,0 +1,72 @@
+# expect: 0. With --disk-faults=full, a node's disk sometimes has no space
+# left: writer's write fails with ENOSPC, and it exits 1, as systems that
+# stop on a failed write do. As the fault heals, the space is back, and
+# writer is started again: its exit isn't an unexpected one. It counts its
+# starts on its disk; after the faults, it was started more than once and
+# writes again. A node excluded from disk faults always has space.
+# args: --timelines 4 --seed 7
+x-lib: &lib |
+  assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+x-timeskip:
+  faults: legacy
+  disk_faults: [full]
+  fault_gap: 2
+services:
+  writer:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network"}
+    environment: {LIB: *lib}
+    volumes: [data:/data]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        n=$$(($$(cat /data/n 2> /dev/null || echo 0) + 1))
+        echo $$n | dd of=/data/n conv=fsync status=none || exit 1
+        mkdir -p /www && echo $$n > /www/n && httpd -p 8080 -h /www
+        # (Its errors to a tmpfs: its own filesystem is on the full disk.)
+        while dd if=/dev/zero of=/data/f bs=64k count=16 conv=fsync 2> /dev/shm/err; do rm /data/f; sleep 0.1; done
+        cat /dev/shm/err
+        assert sometimes Sometimes "a full disk has no space left" $$(grep -q "No space left" /dev/shm/err && echo true || echo false)
+        exit 1
+  spared:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network,disk"}
+    environment: {LIB: *lib}
+    volumes: [kept:/data]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        while :; do
+          dd if=/dev/zero of=/data/f bs=64k count=16 conv=fsync 2> /dev/null; ok=$$?
+          assert always Always "a node excluded from disk faults has space" $$([ $$ok = 0 ] && echo true || echo false)
+          rm -f /data/f
+          sleep 0.1
+        done
+  workload:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network,disk"}
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        printf '#!/bin/sh\nsleep 20\n' > $$d/singleton_driver_wait
+        cat > $$d/finally_check <<'X'
+        #!/bin/sh
+        assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+        n=
+        for i in $$(seq 50); do n=$$(wget -q -T 1 -O - http://writer:8080/n) && break; sleep 0.2; done
+        echo "writer started $$n times"
+        assert always Always "writer answers after the faults" $$([ -n "$$n" ] && echo true || echo false)
+        assert sometimes Sometimes "writer stopped on a full disk and was started again" $$([ "$$n" -gt 1 ] 2> /dev/null && echo true || echo false)
+        X
+        chmod +x $$d/singleton_driver_wait $$d/finally_check
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
+volumes:
+  data:
+  kept:

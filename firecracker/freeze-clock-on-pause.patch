@@ -1,0 +1,195 @@
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -310,6 +310,12 @@
+     device_manager: DeviceManager,
+ }
+ 
++/// kvmclock saved by [`Vmm::pause_vm`] and restored by [`Vmm::resume_vm`], so
++/// that the guest clock stands still while paused. (Stock behaviour: it keeps
++/// running, and the guest sees a jump on resume.)
++#[cfg(target_arch = "x86_64")]
++static PAUSED_CLOCK: Mutex<Option<kvm_bindings::kvm_clock_data>> = Mutex::new(None);
++
+ impl Vmm {
+     /// Gets Vmm version.
+     pub fn version(&self) -> String {
+@@ -465,6 +471,15 @@
+             .vm
+             .as_kvm()
+             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
++        // Freeze-on-pause: put kvmclock back where it was at pause, so the guest
++        // sees no time pass while paused (as after a snapshot restore).
++        #[cfg(target_arch = "x86_64")]
++        if let Some(mut clock) = PAUSED_CLOCK.lock().unwrap().take() {
++            clock.flags = 0;
++            if let Err(err) = kvm_vm.fd().set_clock(&clock) {
++                error!("Cannot restore the paused kvmclock: {err}");
++            }
++        }
+         self.device_manager.kick_virtio_devices();
+         kvm_vm.resume_vcpus()?;
+         self.instance_info.state = VmState::Running;
+@@ -478,6 +493,11 @@
+             .as_kvm()
+             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+         kvm_vm.pause_vcpus()?;
++        #[cfg(target_arch = "x86_64")]
++        match kvm_vm.fd().get_clock() {
++            Ok(clock) => *PAUSED_CLOCK.lock().unwrap() = Some(clock),
++            Err(err) => error!("Cannot save the kvmclock at pause: {err}"),
++        }
+         self.instance_info.state = VmState::Paused;
+         Ok(())
+     }
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -107,6 +107,51 @@
+     response_sender: Sender<VcpuResponse>,
+ }
+ 
++#[cfg(target_arch = "x86_64")]
++thread_local! {
++    /// Guest TSC and TSC deadline saved at pause (one vCPU per thread).
++    static FROZEN_TSC: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
++}
++
++/// _IOW(KVMIO, 0xe2, struct kvm_device_attr)
++#[cfg(target_arch = "x86_64")]
++const KVM_GET_DEVICE_ATTR: libc::c_ulong = 0x4018_aee2;
++/// _IOW(KVMIO, 0xe1, struct kvm_device_attr)
++#[cfg(target_arch = "x86_64")]
++const KVM_SET_DEVICE_ATTR: libc::c_ulong = 0x4018_aee1;
++
++/// Sets the guest TSC to `tsc` through the vCPU's TSC offset
++/// (KVM_VCPU_TSC_OFFSET). (KVM takes a write of IA32_TSC within a second of
++/// the value it expects for a sync, and leaves the TSC running.)
++#[cfg(target_arch = "x86_64")]
++fn set_guest_tsc(vcpu: &crate::arch::x86_64::vcpu::KvmVcpu, tsc: u64) -> Result<(), String> {
++    use crate::arch::x86_64::generated::msr_index::MSR_IA32_TSC;
++    let mut offset = 0u64;
++    let mut attr = kvm_bindings::kvm_device_attr {
++        flags: 0,
++        group: kvm_bindings::KVM_VCPU_TSC_CTRL,
++        attr: u64::from(kvm_bindings::KVM_VCPU_TSC_OFFSET),
++        addr: &mut offset as *mut u64 as u64,
++    };
++    // SAFETY: a vCPU fd, and attr points at offset, which outlives the call.
++    if unsafe { vmm_sys_util::ioctl::ioctl_with_ref(&vcpu.fd, KVM_GET_DEVICE_ATTR, &attr) } != 0 {
++        return Err(format!("KVM_GET_DEVICE_ATTR: {}", io::Error::last_os_error()));
++    }
++    let now = vcpu
++        .get_msrs([MSR_IA32_TSC].into_iter())
++        .map_err(|err| err.to_string())?
++        .get(&MSR_IA32_TSC)
++        .copied()
++        .ok_or_else(|| "no IA32_TSC".to_string())?;
++    let offset = offset.wrapping_add(tsc).wrapping_sub(now);
++    attr.addr = &offset as *const u64 as u64;
++    // SAFETY: as above.
++    if unsafe { vmm_sys_util::ioctl::ioctl_with_ref(&vcpu.fd, KVM_SET_DEVICE_ATTR, &attr) } != 0 {
++        return Err(format!("KVM_SET_DEVICE_ATTR: {}", io::Error::last_os_error()));
++    }
++    Ok(())
++}
++
+ /// States of the vCPU thread's run loop.
+ #[derive(Debug)]
+ enum VcpuRunState {
+@@ -277,6 +322,25 @@
+                 #[cfg(target_arch = "x86_64")]
+                 self.kvm_vcpu.kvmclock_ctrl();
+ 
++                // Freeze-on-pause (see `Vmm::pause_vm`): remember the guest TSC and
++                // TSC deadline, to put back on resume.
++                #[cfg(target_arch = "x86_64")]
++                {
++                    use crate::arch::x86_64::generated::msr_index::{
++                        MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE,
++                    };
++                    match self
++                        .kvm_vcpu
++                        .get_msrs([MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE].into_iter())
++                    {
++                        Ok(m) => FROZEN_TSC.set(Some((
++                            m.get(&MSR_IA32_TSC).copied().unwrap_or(0),
++                            m.get(&MSR_IA32_TSC_DEADLINE).copied().unwrap_or(0),
++                        ))),
++                        Err(err) => error!("Cannot save the guest TSC at pause: {err}"),
++                    }
++                }
++
+                 // Move to 'paused' state.
+                 state = VcpuRunState::Paused;
+             }
+@@ -326,6 +390,26 @@
+                     );
+                     self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+                 }
++                // Freeze-on-pause: the TSC first, then the deadline (as on snapshot
++                // restore), so the armed guest timer is re-primed against the old TSC.
++                #[cfg(target_arch = "x86_64")]
++                if let Some((tsc, deadline)) = FROZEN_TSC.take() {
++                    use crate::arch::x86_64::generated::msr_index::MSR_IA32_TSC_DEADLINE;
++                    use crate::arch::x86_64::msr::set_msrs;
++                    let entry = |index, data| kvm_bindings::kvm_msr_entry {
++                        index,
++                        data,
++                        ..Default::default()
++                    };
++                    let mut res = set_guest_tsc(&self.kvm_vcpu, tsc);
++                    if res.is_ok() && deadline != 0 {
++                        res = set_msrs(&self.kvm_vcpu.fd, &[entry(MSR_IA32_TSC_DEADLINE, deadline)])
++                            .map_err(|err| err.to_string());
++                    }
++                    if let Err(err) = res {
++                        error!("Cannot restore the guest TSC on resume: {err}");
++                    }
++                }
+                 self.response_sender
+                     .send(VcpuResponse::Resumed)
+                     .expect("vcpu channel unexpectedly closed");
+@@ -342,7 +426,24 @@
+                 // Save vcpu state.
+                 self.kvm_vcpu
+                     .save_state()
+-                    .map(|vcpu_state| {
++                    .map(|mut vcpu_state| {
++                        // Freeze-on-pause: the guest TSC and TSC deadline at pause
++                        // (see `Vmm::pause_vm`), like the kvmclock.
++                        #[cfg(target_arch = "x86_64")]
++                        if let Some((tsc, deadline)) = FROZEN_TSC.get() {
++                            use crate::arch::x86_64::generated::msr_index::{
++                                MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE,
++                            };
++                            for msrs in vcpu_state.saved_msrs.iter_mut() {
++                                for e in msrs.as_mut_slice() {
++                                    match e.index {
++                                        MSR_IA32_TSC => e.data = tsc,
++                                        MSR_IA32_TSC_DEADLINE => e.data = deadline,
++                                        _ => {}
++                                    }
++                                }
++                            }
++                        }
+                         self.response_sender
+                             .send(VcpuResponse::SavedState(Box::new(vcpu_state)))
+                             .expect("vcpu channel unexpectedly closed");
+diff --git a/src/vmm/src/arch/x86_64/vm.rs b/src/vmm/src/arch/x86_64/vm.rs
+--- a/src/vmm/src/arch/x86_64/vm.rs
++++ b/src/vmm/src/arch/x86_64/vm.rs
+@@ -187,7 +187,12 @@
+     pub fn save_state(&self) -> Result<VmState, KvmVmError> {
+         let pitstate = self.fd().get_pit2().map_err(KvmVmError::VmGetPit2)?;
+ 
+-        let clock = self.fd().get_clock().map_err(KvmVmError::VmGetClock)?;
++        // Freeze-on-pause: the kvmclock at pause (see `Vmm::pause_vm`), so a
++        // restored guest doesn't see the time spent paused before this save.
++        let clock = match *crate::PAUSED_CLOCK.lock().unwrap() {
++            Some(clock) => clock,
++            None => self.fd().get_clock().map_err(KvmVmError::VmGetClock)?,
++        };
+ 
+         let mut pic_master = kvm_irqchip {
+             chip_id: KVM_IRQCHIP_PIC_MASTER,

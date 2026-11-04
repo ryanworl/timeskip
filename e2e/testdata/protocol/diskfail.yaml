@@ -1,0 +1,86 @@
+# expect: 0. With --disk-faults=fail, a node whose disk is failing (its
+# loop device's timeskip_fail) sometimes fails to write and fsync a file,
+# to read one, and to create, remove or fsync a directory (EIO, as the
+# filesystem's metadata fails), and never otherwise. (Its probe runs in its
+# main process: a node whose reads or writes failed is rebooted as the
+# fault heals, and its probe starts again.) A node labeled
+# com.antithesis.exclude_from_faults with "disk" never fails.
+# args: --timelines 4 --seed 7
+x-lib: &lib |
+  assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true, \"details\": $${5:-null}}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+  # (The node's disk is the loop device /data is on.)
+  dev=$$(awk '$$5 == "/data" { for (i = 7; $$i != "-"; i++); print $$(i + 2) }' /proc/self/mountinfo)
+  sys=/sys/block/$${dev#/dev/}/loop
+  echo "disk: $$dev"
+x-timeskip:
+  faults: legacy
+  disk_faults: [fail]
+  fault_gap: 2
+services:
+  disk:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network"}
+    environment: {LIB: *lib}
+    volumes: [data:/data]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        tf() { [ $$? = 0 ] && echo true || echo false; }
+        last=x before=x i=0
+        while :; do
+          sleep 0.1
+          i=$$((i + 1))
+          q0=$$(cat $$sys/timeskip_fail) f0=$$(cat $$sys/timeskip_failed)
+          dd if=/dev/zero of=/data/f bs=256k count=2 conv=fsync 2> /dev/null; w=$$(tf)
+          dd if=/data/f of=/dev/null bs=256k iflag=direct 2> /dev/null; r=$$(tf)
+          # (rm -rf first: a run before a reboot may have left it.)
+          rm -rf /data/d && mkdir /data/d && touch /data/d/x && sync /data/d && rm -r /data/d; m=$$(tf)
+          q1=$$(cat $$sys/timeskip_fail) f1=$$(cat $$sys/timeskip_failed)
+          # (Not across a change of timeskip_fail, nor the two probes
+          # after one: an earlier write's error can show in the next
+          # fsync. A fault of 100 ms can start and heal within one probe:
+          # then timeskip_failed moved.)
+          [ "$$q0" = "$$q1" ] && [ "$$q0" = "$$last" ] && [ "$$q0" = "$$before" ] || { before=$$last last=$$q1; continue; }
+          if [ "$$q0" = 0 ] && [ "$$f0" = "$$f1" ]; then
+            assert always Always "a disk that isn't failing reads and writes" $$([ $$w$$r$$m = truetruetrue ] && echo true || echo false) "{\"write\": $$w, \"read\": $$r, \"metadata\": $$m, \"probe\": $$i, \"failed\": $$f1}"
+          elif [ "$$q0" != 0 ]; then
+            echo "failing ($$q0 ppm): write $$w, read $$r, metadata $$m"
+            assert sometimes Sometimes "a failing disk fails a write" $$([ $$w = false ] && echo true || echo false)
+            assert sometimes Sometimes "a failing disk fails a read" $$([ $$r = false ] && echo true || echo false)
+            assert sometimes Sometimes "a failing disk fails a metadata operation" $$([ $$m = false ] && echo true || echo false)
+          fi
+        done
+  spared:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network,disk"}
+    environment: {LIB: *lib}
+    volumes: [kept:/data]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        while :; do
+          for i in $$(seq 10); do
+            [ "$$(cat $$sys/timeskip_fail)" = 0 ] && dd if=/dev/zero of=/data/f bs=64k count=4 conv=fsync 2> /dev/null && dd if=/data/f of=/dev/null bs=64k iflag=direct 2> /dev/null; ok=$$?
+            assert always Always "a node excluded from disk faults never fails" $$([ $$ok = 0 ] && echo true || echo false)
+            sleep 0.1
+          done
+        done
+  workload:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network,disk"}
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        printf '#!/bin/sh\nsleep 20\n' > $$d/singleton_driver_wait
+        chmod +x $$d/singleton_driver_wait
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
+volumes:
+  data:
+  kept:

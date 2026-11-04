@@ -1,0 +1,25 @@
+# Ping-pong between two containers. pong answers each "ping N" after 1 s;
+# the test template in workload (workload/test, at
+# /opt/antithesis/test/v1/pingpong) drives it: a first_ handshake,
+# parallel_driver_ pings, an anytime_ check and a finally_ tally. A timeline
+# is several seconds of guest time, nearly all of it asleep. Each service
+# has a build context of its own, so that an edit one syncs doesn't rebuild
+# the other.
+services:
+  pong:
+    image: timeskip/pingpong
+    build: ./pong
+    command: [nc, -lk, -p, "7000", -e, /usr/local/bin/pong.sh]
+    init: true              # so that nc stops on SIGTERM (a restart)
+    develop:
+      watch:                # timeskip test syncs pong.sh, as compose watch would
+        - {action: sync+restart, path: ./pong/pong.sh, target: /usr/local/bin/pong.sh}
+
+  workload:
+    image: timeskip/pingpong-workload
+    build: ./workload
+    command: [setup.sh]     # writes setup_complete once pong answers
+    init: true
+    develop:
+      watch:
+        - {action: sync, path: ./workload/test, target: /opt/antithesis/test/v1/pingpong}

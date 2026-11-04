@@ -1,0 +1,17 @@
+# A project that uses Antithesis's Python SDK, which writes through
+# /usr/lib/libvoidstar.so as it does on Antithesis: a test command draws
+# random numbers and asserts, and another container, as a non-root user,
+# asserts and says that setup is complete. Both report coverage of a module
+# through libvoidstar (e2e_coverage.py): the other container reaches edge 8 in
+# setup, the driver edge 1 and one of 2, 3 and 4, by the number it drew.
+# The explore template's driver is for --explore, and the replan template
+# for a branch's ending drawn anew.
+services:
+  app:
+    build: .
+    image: timeskip-e2e/sdk
+    command: [sleep, "2147483647"]
+  other:
+    image: timeskip-e2e/sdk
+    user: "1000"
+    command: [python, -c, "from antithesis.assertions import always; from antithesis.lifecycle import setup_complete; from e2e_coverage import reach; import os, time; always(os.getuid() == 1000, 'a non-root container asserts'); reach(8); setup_complete(); time.sleep(1e9)"]

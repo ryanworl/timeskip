@@ -1,0 +1,61 @@
+# expect: 0. With faults, the test commands run in a container on the
+# network of one (b) that's on a server's (a): the three are one node, which
+# --fault-exclusions excludes for the one container it matches, so it's
+# never paused, stopped or killed (nor clogged or partitioned). The commands
+# always reach a on localhost. Another node is alike, x, x1 on its network
+# and x2 on x1's, with servers in x and x2: node faults take the three down
+# and bring them back, and both servers answer once the faults are healed.
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --timelines 4 --seed 11
+x-timeskip:
+  faults: high_availability
+  fault_gap: 1
+services:
+  a:
+    image: busybox:1.36
+    command: [sh, -c, "mkdir -p /www && echo ok > /www/ok && exec httpd -f -p 8080 -h /www"]
+  b:
+    image: busybox:1.36
+    network_mode: service:a
+    command: [sleep, "2147483647"]
+  x:
+    image: busybox:1.36
+    command: [sh, -c, "mkdir -p /www && echo ok > /www/ok && exec httpd -f -p 8081 -h /www"]
+  x1:
+    image: busybox:1.36
+    network_mode: service:x
+    command: [sleep, "2147483647"]
+  x2:
+    image: busybox:1.36
+    network_mode: service:x1
+    command: [sh, -c, "mkdir -p /www && echo ok > /www/ok && exec httpd -f -p 8082 -h /www"]
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    network_mode: service:b
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/helper_assert <<'X'
+        assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"always\", \"display_type\": \"Always\", \"message\": \"$$1\", \"condition\": $$2, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+        probe() { wget -q -T 1 -O /dev/null "$$1" && echo true || echo false; }
+        X
+        cat > $$d/singleton_driver_local <<'X'
+        #!/bin/sh
+        . /opt/antithesis/test/v1/t/helper_assert
+        for i in $$(seq 20); do assert "a answers on localhost" $$(probe http://127.0.0.1:8080/ok); sleep 1; done
+        X
+        cat > $$d/finally_reachable <<'X'
+        #!/bin/sh
+        . /opt/antithesis/test/v1/t/helper_assert
+        retry() { for i in 1 2 3 4 5 6 7 8 9 10; do [ $$(probe "$$1") = true ] && echo true && return; sleep 0.5; done; echo false; }
+        assert "x answers once the faults are healed" $$(retry http://x:8081/ok)
+        assert "x2 answers once the faults are healed" $$(retry http://x:8082/ok)
+        assert "a answers on localhost once the faults are healed" $$(probe http://127.0.0.1:8080/ok)
+        X
+        chmod +x $$d/singleton_driver_local $$d/finally_reachable
+        until wget -q -T 1 -O /dev/null http://x:8081/ok && wget -q -T 1 -O /dev/null http://x:8082/ok && wget -q -T 1 -O /dev/null http://127.0.0.1:8080/ok; do sleep 0.2; done
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
