@@ -33,11 +33,12 @@ const usage = `usage:
                 [--explore] [--branch DIR] [--no-build] [--no-skip]
       Run the project's test templates (/opt/antithesis/test/v1/NAME/ in its
       containers): N timelines of each (default 1), up to -j at a time
-      (default: one per CPU core), each from a checkpoint saved once the project
-      wrote setup_complete. A compose file (default compose.yaml) is built
-      where it changed (not with --no-build: its images as they are, as
-      Antithesis takes them), bundled into the cache, and its develop.watch
-      sync rules applied as docker compose watch would; a bundle runs as it is.
+      (default: one per CPU core, the most for all runs on the host), each
+      from a checkpoint saved once the project wrote setup_complete. A
+      compose file (default compose.yaml) is built where it changed (not
+      with --no-build: its images as they are, as Antithesis takes them),
+      bundled into the cache, and its develop.watch sync rules applied as
+      docker compose watch would; a bundle runs as it is.
       The project's x-timeskip block sets how its timelines run, and each
       --set KEY=VALUE overrides one of its keys for this run:
         faults: high_availability (the default), resilient, legacy or none:
@@ -486,17 +487,6 @@ func nonce() string { b := make([]byte, 6); crand.Read(b); return hex.EncodeToSt
 
 // hash is a short digest of its arguments, for cache keys.
 func hash(a ...any) string { return fmt.Sprintf("%x", sha256.Sum256(fmt.Append(nil, a...)))[:16] }
-
-// cores is the number of CPU cores: CPUs less hardware threads that share a
-// core. A timeline's VM has one vCPU, and two of them on one core's threads
-// each take up to twice the CPU time for the same work.
-// (x86_64's SMT has two threads a core; macOS has none.)
-func cores() int {
-	if b, _ := os.ReadFile("/sys/devices/system/cpu/smt/active"); strings.TrimSpace(string(b)) == "1" {
-		return max(1, runtime.NumCPU()/2)
-	}
-	return runtime.NumCPU()
-}
 
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 

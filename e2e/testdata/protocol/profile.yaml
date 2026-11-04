@@ -1,8 +1,9 @@
 # expect: 0. --profile samples the containers' stacks every 10 ms of CPU
 # time: a driver copies /dev/zero to /dev/null for 1 s of guest time, then
 # sleeps 30 s, and another container only sleeps. e2e_test.go checks the
-# folded stacks: about 100 samples of dd, in the kernel's vfs_read among
-# others, none of the idle container, and the sleep still skipped.
+# folded stacks: a sample of dd for each 10 ms of the command's CPU time
+# (about 100), in the kernel's vfs_read among others, none of the idle
+# container, and the sleep still skipped.
 # args: --profile
 services:
   idle:

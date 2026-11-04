@@ -798,14 +798,13 @@ func TestProtocol(t *testing.T) {
 				for _, c := range tl.Commands {
 					cpu[c.Name] = c.CPUMs
 				}
-				// The spin's guest second is more or less CPU time as the
-				// host loads, so the spin is judged against the kernel's
-				// account of its child (in 10 ms ticks), which counts the
-				// same way: all of it (none if its child's didn't count),
-				// and not twice; the rest, the script's own, includes the
-				// time the host took the vCPU away while it ran, hundreds
-				// of ms on a loaded host. The sleep, and the idle
-				// container, are judged against the spin.
+				// The spin's guest second is less CPU time as the host
+				// takes the vCPU away (the guest counts that as stolen), so
+				// the spin is judged against the kernel's account of its
+				// child (in 10 ms ticks), which counts the same way: all of
+				// it (none if its child's didn't count), and not twice.
+				// The sleep, and the idle container, are judged against
+				// the spin.
 				var child int64 = -1
 				if m := regexp.MustCompile(`the child's CPU time: (\d+) ms`).FindStringSubmatch(out); m != nil {
 					child, _ = strconv.ParseInt(m[1], 10, 64)
@@ -834,8 +833,15 @@ func TestProtocol(t *testing.T) {
 						idle += k
 					}
 				}
-				if dd < 50 || dd > 150 || !read || idle > 0 {
-					t.Errorf("profile: %d samples of dd (vfs_read among them: %v), %d of the idle container:\n%s", dd, read, idle, b)
+				// (A sample each 10 ms of CPU time, so many as the command
+				// used: the time the host took the vCPU away is stolen, not
+				// the command's, and nothing samples it.)
+				var cpu int64
+				for _, c := range tl.Commands {
+					cpu += c.CPUMs
+				}
+				if cpu < 500 || int64(dd)*10 < cpu/2 || int64(dd)*10 > cpu*3/2 || !read || idle > 0 {
+					t.Errorf("profile: %d samples of dd for %d ms of CPU time (vfs_read among them: %v), %d of the idle container:\n%s", dd, cpu, read, idle, b)
 				}
 				if tl.GuestMs < 31000 || tl.Wall > 15 {
 					t.Errorf("profiling, %.0f ms of guest time took %.1f s", tl.GuestMs, tl.Wall)

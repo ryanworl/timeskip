@@ -1,10 +1,22 @@
 package main
 
 import (
+	"encoding/binary"
 	"os/exec"
+	"runtime"
 	"strings"
 	"syscall"
 )
+
+// cores is the number of performance cores: an efficiency core takes two
+// or three times the CPU time for the same work.
+func cores() int {
+	b, err := syscall.Sysctl("hw.perflevel0.physicalcpu")
+	if err != nil || len(b) > 4 {
+		return runtime.NumCPU()
+	}
+	return max(1, int(binary.LittleEndian.Uint32([]byte(b+"\x00\x00\x00\x00"))))
+}
 
 // clone copies file src to dst: a copy-on-write clone (APFS).
 func clone(src, dst string) {

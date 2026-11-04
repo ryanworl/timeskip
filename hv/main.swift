@@ -1,6 +1,7 @@
 // hvrun: run the time-skip guest on Hypervisor.framework (Apple silicon,
 // macOS 15+). Run by timeskip. One vCPU, Hypervisor.framework's GICv3, a
-// virtio-mmio console (hvc0), disks and entropy, PSCI over HVC.
+// virtio-mmio console (hvc0), disks and entropy, PSCI over HVC, and stolen
+// time (SMCCC's paravirtualized time).
 //
 // The difference is restore: "@save PATH" writes the machine state to PATH
 // and guest memory to PATH.mem, and --restore PATH maps PATH.mem
@@ -11,7 +12,9 @@
 //
 // The guest's virtual counter stands still while the VM is paused or
 // saved: a restored or resumed VM continues from the count it was saved
-// at.
+// at. Otherwise it runs, and the guest counts as stolen what the vCPU
+// didn't run of it (see steal), as a KVM guest does its vCPU thread's waits
+// for a CPU: not the task that ran's CPU time.
 //
 // --share TAG=DIR is a read-only virtio-fs device.
 //
@@ -55,6 +58,7 @@ mach_timebase_info(&timebase)
 let gicdBase: UInt64 = 0x0800_0000, gicrBase: UInt64 = 0x080a_0000
 let rtcBase: UInt64 = 0x0901_0000 // a PL031 real-time clock: the guest's time of day at boot
 let virtioBase: UInt64 = 0x0a00_0000, virtioStride: UInt64 = 0x200
+let stealBase: UInt64 = 0x0b00_0000 // the stolen time structure (SMCCC DEN0057A)
 let ramBase: UInt64 = 0x4000_0000
 let ramSize = memMB << 20
 let page = Int(vm_page_size)
@@ -67,6 +71,7 @@ struct MachineState: Codable {
 	var sys: [[UInt64]] // [register, value]
 	var icc: [[UInt64]]
 	var cntvct: UInt64 // the virtual counter when saved
+	var stolen: UInt64 // the stolen time, ns
 	var gic: Data // hv_gic_state_get_data
 	var devices: [DeviceState]
 }
@@ -116,6 +121,21 @@ mem = Mem(base: ramBase, size: ramSize, host: ram)
 
 check(hv_vm_create(nil), "hv_vm_create")
 check(hv_vm_map(ram, ramBase, Int(ramSize), hv_memory_flags_t(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)), "hv_vm_map")
+// (Its revision and attributes, at 0 and 4, are 0.)
+let stealPage = mmap(nil, page, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)!
+check(hv_vm_map(stealPage, stealBase, page, hv_memory_flags_t(HV_MEMORY_READ | HV_MEMORY_WRITE)), "hv_vm_map")
+
+// steal adds ns to the stolen time: the time the guest's counter ran and its
+// vCPU didn't, while the host ran other threads, or this one handled an exit
+// (a disk's I/O, say: the guest would otherwise count the time as the CPU
+// time of the task that wrote to the device). Not while it waits in WFI,
+// which is the guest's idle time.
+var stolen: UInt64 = 0
+func steal(_ ns: UInt64) {
+	stolen &+= ns
+	stealPage.storeBytes(of: stolen.littleEndian, toByteOffset: 8, as: UInt64.self)
+}
+func now() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
 
 let gicConfig = hv_gic_config_create()
 check(hv_gic_config_set_distributor_base(gicConfig, gicdBase), "GIC distributor base")
@@ -292,6 +312,8 @@ func restoreMachine(_ s: MachineState) {
 	for r in s.icc { check(hv_gic_set_icc_reg(vcpu, hv_gic_icc_reg_t(rawValue: UInt16(r[0])), r[1]), "set ICC register \(r[0])") }
 	if s.devices.count != devs.count { fail("the saved machine has \(s.devices.count) devices, not \(devs.count)") }
 	for (t, d) in zip(devs, s.devices) { t.restore(d) }
+	stolen = s.stolen
+	steal(0)
 }
 
 func save(_ path: String, cntvct: UInt64) {
@@ -320,7 +342,7 @@ func save(_ path: String, cntvct: UInt64) {
 			check(hv_gic_get_icc_reg(vcpu, hv_gic_icc_reg_t(rawValue: r), &v), "get ICC register \(r)")
 			return [UInt64(r), v]
 		},
-		cntvct: cntvct, gic: gic, devices: devs.map(\.state))
+		cntvct: cntvct, stolen: stolen, gic: gic, devices: devs.map(\.state))
 	do {
 		try JSONEncoder().encode(s).write(to: URL(fileURLWithPath: path))
 	} catch { fail("save failed: \(error)") }
@@ -444,7 +466,9 @@ func wfi() {
 		let ns = Double(cval - now) * Double(timebase.numer) / Double(timebase.denom)
 		deadline = .now() + .nanoseconds(Int(min(ns, 3.6e12)))
 	}
+	steal(now() - exited)
 	_ = wake.wait(timeout: deadline)
+	exited = now()
 }
 
 let notSupported = UInt64(bitPattern: -1)
@@ -452,7 +476,12 @@ func psci() {
 	var r = notSupported
 	switch UInt32(truncatingIfNeeded: reg(0)) {
 	case 0x8400_0000: r = 0x1_0000 // PSCI_VERSION: 1.0
+	case 0x8400_000a: if reg(1) == 0x8000_0000 { r = 0 } // PSCI_FEATURES: SMCCC_VERSION
 	case 0x8400_0008, 0x8400_0009: exit(0) // SYSTEM_OFF, SYSTEM_RESET
+	case 0x8000_0000: r = 0x1_0001 // SMCCC_VERSION: 1.1
+	case 0x8000_0001: if reg(1) == 0xc500_0020 { r = 0 } // SMCCC_ARCH_FEATURES: PV_TIME_FEATURES
+	case 0xc500_0020: if reg(1) == 0xc500_0021 { r = 0 } // PV_TIME_FEATURES: PV_TIME_ST
+	case 0xc500_0021: r = stealBase // PV_TIME_ST
 	default: break
 	}
 	setReg(0, r)
@@ -479,9 +508,16 @@ func mmio(_ pa: UInt64, _ len: Int, write v: UInt64?) -> UInt64 {
 // took host time the guest mustn't see.
 if let s = saved { setCounter(s.cntvct) }
 
+// exited is when the vCPU last stopped running the guest (or a wait the
+// guest's counter didn't run through, or WFI's, ended).
+var exited = now()
 while true {
+	steal(now() - exited)
 	service()
+	let w = now(), c = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
 	check(hv_vcpu_run(vcpu), "hv_vcpu_run")
+	exited = now()
+	steal((exited - w) - min(exited - w, clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c))
 	let e = exitInfo!.pointee
 	switch e.reason {
 	case HV_EXIT_REASON_CANCELED: continue

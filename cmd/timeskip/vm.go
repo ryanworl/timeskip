@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ryanworl/timeskip/internal/protocol"
@@ -58,6 +59,22 @@ func guest() (kernel, rootfs string) {
 	return filepath.Join(home, "share", "vmlinux-x86_64"), filepath.Join(home, "share", "rootfs-x86_64.erofs")
 }
 
+// slot waits for one of the host's VM slots, one per core (see cores),
+// across every run on the host: a VM that waits for a core counts the wait
+// as CPU time, and as guest time. It returns the slot's lock.
+func slot() int {
+	d := fmt.Sprintf("/tmp/timeskip-slots-%d", os.Getuid()) // (not $TMPDIR, which a process can change)
+	check(os.MkdirAll(d, 0o700))
+	for {
+		for i := range cores() {
+			if fd, ok := tryLock(filepath.Join(d, strconv.Itoa(i)), syscall.LOCK_EX); ok {
+				return fd
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // cmdline is the guest kernel's command line, with root its root disk.
 func cmdline(nonce, root string) string {
 	// (no-kvmapf: without KVM's async page faults, a page of guest memory
@@ -79,6 +96,7 @@ func cmdline(nonce, root string) string {
 // Firecracker tracks the pages it writes (for a save over a copy of mem;
 // see save).
 func start(dir, nonce string, disks []disk, share string, from *checkpoint, data, img string, track bool) *vm {
+	slot := slot() // (first: sweep takes a socket's directory a minute old with no socket for a dead run's)
 	check(os.MkdirAll(dir, 0o755))
 	v := &vm{dir: dir, nonce: nonce, ctl: make(chan ctlLine, 16), saved: make(chan struct{}, 4), gone: make(chan struct{}), logged: make(chan struct{}), stop: make(chan struct{})}
 	k, rootfs := guest()
@@ -139,11 +157,12 @@ func start(dir, nonce string, disks []disk, share string, from *checkpoint, data
 	check(v.cmd.Start())
 	outW.Close()
 	errsW.Close()
-	atExit(v.reap)
 	go func() {
 		v.cmd.Wait()
+		syscall.Close(slot)
 		close(v.gone)
 	}()
+	atExit(v.reap) // (after the above: once exit began, it reaps at once)
 	errsRead := make(chan struct{})
 	go func() {
 		defer close(errsRead)

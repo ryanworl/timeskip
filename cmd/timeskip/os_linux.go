@@ -6,11 +6,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 )
 
 const seekData, seekHole = 3, 4
+
+// cores is the number of CPU cores: CPUs less hardware threads that share a
+// core (x86_64's SMT has two a core). A VM on one core's thread takes up to
+// twice the CPU time for the same work as one with the core to itself.
+func cores() int {
+	if b, _ := os.ReadFile("/sys/devices/system/cpu/smt/active"); strings.TrimSpace(string(b)) == "1" {
+		return max(1, runtime.NumCPU()/2)
+	}
+	return runtime.NumCPU()
+}
 
 // clone copies file src to dst: a copy-on-write clone where the filesystem
 // has them (XFS, btrfs), else its data, in the kernel (copy_file_range, or

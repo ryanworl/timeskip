@@ -4,7 +4,7 @@
 # (its cutime and cstime, in its output), a finally_ command
 # sleeps 1 s, and another container only sleeps. e2e_test.go checks cpu_ms
 # and container_cpu_ms against the child's account, not the guest second,
-# which a loaded host makes more or less CPU time.
+# which is less CPU time as the host takes the vCPU away (stolen time).
 services:
   idle:
     image: busybox:1.36
