@@ -213,6 +213,7 @@ func setup(bundle string) {
 	}
 	idle()
 	checkExits()
+	sumTargets()
 	cat, _, err := discover()
 	check(err)
 	freeze(true)

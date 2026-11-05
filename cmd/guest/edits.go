@@ -6,6 +6,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -27,6 +30,8 @@ import (
 //	delete      "service<TAB>target<TAB>name<TAB>action" per line: target
 //	            was deleted on the host, as part of the edit named name
 //	            (replace's, if it has a file)
+//	sums        "path<TAB>sha256" per line: each regular file's digest, by
+//	            its path in /inputs
 type edit struct {
 	service, target, name, action string
 	del                           bool
@@ -43,7 +48,18 @@ func mountInputs(spec string) {
 	}
 }
 
+// inputSums are the digests of the regular files in /inputs, by path in it.
+var inputSums map[string]string
+
 func readEdits() []edit {
+	inputSums = map[string]string{}
+	if b, err := os.ReadFile("/inputs/sums"); err == nil {
+		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			if p, sum, ok := strings.Cut(l, "\t"); ok {
+				inputSums[p] = sum
+			}
+		}
+	}
 	var e []edit
 	for _, f := range []string{"replace", "delete"} {
 		b, err := os.ReadFile("/inputs/" + f)
@@ -125,7 +141,7 @@ func differs(src, dst string) bool {
 			lb, _ := os.Readlink(filepath.Join(dst, rel))
 			d = la != lb
 		case a.Mode().IsRegular():
-			d = a.Size() != b.Size() || !sameContents(p, filepath.Join(dst, rel))
+			d = a.Size() != b.Size() || !same(p, filepath.Join(dst, rel), b)
 		}
 		if d {
 			return filepath.SkipAll
@@ -135,10 +151,80 @@ func differs(src, dst string) bool {
 	return d
 }
 
-func sameContents(a, b string) bool {
-	x, err1 := os.ReadFile(a)
-	y, err2 := os.ReadFile(b)
+// same reports whether file p in /inputs holds what file q, as fi, does:
+// by their digests, if q is as setup left it (see sumTargets), or else by
+// reading both. (The disks' reads take real time: the guest skips none
+// while a thread waits on them, and each timeline would read every synced
+// file, from a checkpoint without a page cache.)
+func same(p, q string, fi fs.FileInfo) bool {
+	rel, _ := filepath.Rel("/inputs", p)
+	if want, ok := inputSums[rel]; ok {
+		if have, ok := setupSums[statKey(q, fi)]; ok {
+			return want == have
+		}
+	}
+	x, err1 := os.ReadFile(p)
+	y, err2 := os.ReadFile(q)
 	return err1 == nil && err2 == nil && bytes.Equal(x, y)
+}
+
+// setupSums are the digests of the regular files under the sync rules'
+// targets as setup left them, by statKey: in the checkpoints, so that
+// every timeline compares its edits to files it didn't change without
+// reading them.
+var setupSums map[string]string
+
+// statKey is file p's path and what changing it changes.
+func statKey(p string, fi fs.FileInfo) string {
+	st := fi.Sys().(*syscall.Stat_t)
+	return fmt.Sprintf("%s %d %d %d %d %d", p, st.Ino, st.Size, st.Mtim.Nano(), st.Ctim.Nano(), fi.Mode())
+}
+
+// sumTargets fills setupSums from the containers of the services with
+// develop.watch sync rules.
+func sumTargets() {
+	b, err := os.ReadFile(bundled + "/compose.yaml")
+	check(err)
+	var p struct {
+		Services map[string]struct {
+			Develop struct {
+				Watch []struct{ Action, Target string }
+			}
+		}
+	}
+	check(json.Unmarshal(b, &p))
+	setupSums = map[string]string{}
+	for name, s := range p.Services {
+		for _, w := range s.Develop.Watch {
+			if w.Action != "sync" && w.Action != "sync+restart" {
+				continue
+			}
+			cs, err := containers(name)
+			check(err)
+			for _, c := range cs {
+				if c.State.Pid == 0 {
+					continue
+				}
+				root := filepath.Join(resolve(c.root(), filepath.Dir(w.Target)), filepath.Base(w.Target))
+				filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+					if err != nil || !d.Type().IsRegular() {
+						return nil
+					}
+					fi, err1 := d.Info()
+					f, err2 := os.Open(p)
+					if err1 != nil || err2 != nil {
+						return nil
+					}
+					defer f.Close()
+					h := sha256.New()
+					if _, err := io.Copy(h, f); err == nil {
+						setupSums[statKey(p, fi)] = fmt.Sprintf("%x", h.Sum(nil))
+					}
+					return nil
+				})
+			}
+		}
+	}
 }
 
 // tarOf archives src as name (a file, or a directory and its contents).

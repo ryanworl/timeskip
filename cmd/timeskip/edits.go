@@ -69,7 +69,7 @@ func syncedEdits(b string) []edit {
 }
 
 // staged edits, in dir/inputs: copies of the files, with the manifests
-// replace and delete (see cmd/guest). On Linux they become an ext4 image,
+// replace, delete and sums (see cmd/guest). On Linux they become an ext4 image,
 // img, for the VMs' inputs drive.
 type staged struct {
 	dir, spec, img string
@@ -80,7 +80,7 @@ type staged struct {
 func stage(d string, edits []edit) *staged {
 	s := &staged{dir: filepath.Join(d, "inputs"), spec: "none", edits: edits}
 	check(os.MkdirAll(s.dir, 0o755))
-	var replace, del strings.Builder
+	var replace, del, sums strings.Builder
 	for i, e := range edits {
 		name := strconv.Itoa(i)
 		for _, p := range e.deleted {
@@ -96,6 +96,9 @@ func stage(d string, edits []edit) *staged {
 			}
 			rel, _ := filepath.Rel(e.file, p)
 			copyEntry(p, fi, filepath.Join(dst, rel))
+			if fi.Mode().IsRegular() {
+				fmt.Fprintf(&sums, "%s\t%s\n", filepath.ToSlash(filepath.Join(name, rel)), sum(p))
+			}
 			if !fi.IsDir() {
 				paths = append(paths, filepath.Join(e.target, rel))
 			}
@@ -107,10 +110,22 @@ func stage(d string, edits []edit) *staged {
 	}
 	write(filepath.Join(s.dir, "replace"), replace.String())
 	write(filepath.Join(s.dir, "delete"), del.String())
+	write(filepath.Join(s.dir, "sums"), sums.String())
 	if replace.Len()+del.Len() > 0 {
 		s.seal(d)
 	}
 	return s
+}
+
+// sum is file p's SHA-256.
+func sum(p string) string {
+	f, err := os.Open(p)
+	check(err)
+	defer f.Close()
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	check(err)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // copyEntry copies p, a directory (not what's in it), a symlink or a file, to
