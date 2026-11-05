@@ -597,10 +597,18 @@ func save(path, plat string, images []string) error {
 	return nil
 }
 
+// buildPolicy makes a build the same on any host from the same files and
+// base images: timestamps at 0 (the config's, and with the containerd image
+// store the files'; the build's own SOURCE_DATE_EPOCH wins), and no
+// provenance attestation. (buildInputs digests it: an image built otherwise
+// is built again.)
+var buildPolicy = []string{"--output", "type=image,unpack=false,rewrite-timestamp=true", "--provenance=false", "--build-arg", "SOURCE_DATE_EPOCH=0"}
+
 // build builds an image.
 func build(img string, b buildSpec, plat string, log io.Writer) error {
 	ctx := b.Context
-	args := []string{"build", "-q", "--load", "-t", img, "--platform", plat, "-f", b.dockerfile()}
+	args := append([]string{"build", "-q"}, buildPolicy...)
+	args = append(args, "-t", img, "--platform", plat, "-f", b.dockerfile())
 	if b.Target != "" {
 		args = append(args, "--target", b.Target)
 	}

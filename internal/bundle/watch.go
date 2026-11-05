@@ -201,6 +201,7 @@ func buildInputs(name string, s service, b *buildSpec, syncs []Sync, sums *fileS
 	h := sha256.New()
 	opts, _ := json.Marshal(b)
 	h.Write(opts)
+	fmt.Fprintln(h, buildPolicy)
 	synced := func(p string, dir bool) bool {
 		return slices.ContainsFunc(syncs, func(y Sync) bool {
 			return y.Service == name && (p == y.Path || strings.HasPrefix(p, y.Path+"/")) && !y.Skip(p, dir)
