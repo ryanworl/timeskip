@@ -51,13 +51,14 @@ func syncedEdits(b string) []edit {
 		case !strings.HasPrefix(h.Name, "synced/"):
 		case h.Typeflag == tar.TypeDir:
 			check(os.MkdirAll(dst, 0o755))
+			check(os.Chmod(dst, 0o755)) // (whatever the umask, as below)
 		case h.Typeflag == tar.TypeSymlink:
 			check(os.Symlink(h.Linkname, dst))
 		default:
 			w, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, h.FileInfo().Mode().Perm())
 			check(err)
 			_, err = io.Copy(w, r)
-			check(cmp.Or(err, w.Close()))
+			check(cmp.Or(err, w.Close(), os.Chmod(dst, h.FileInfo().Mode().Perm())))
 		}
 	}
 	var in []edit
@@ -132,7 +133,8 @@ func sum(p string) string {
 func copyEntry(p string, fi fs.FileInfo, to string) {
 	switch {
 	case fi.IsDir():
-		check(os.Mkdir(to, fi.Mode().Perm()|0o700)) // (and writable, to fill)
+		check(os.Mkdir(to, 0o700))
+		check(os.Chmod(to, fi.Mode().Perm()|0o700)) // (and writable, to fill; Chmod: whatever the umask)
 	case fi.Mode().Type()&fs.ModeSymlink != 0:
 		l, err := os.Readlink(p)
 		check(err)
@@ -143,8 +145,8 @@ func copyEntry(p string, fi fs.FileInfo, to string) {
 		defer in.Close()
 		out, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fi.Mode().Perm())
 		check(err)
-		_, err = io.Copy(out, in) // (copy_file_range on Linux: a reflink where it can)
-		check(errors.Join(err, out.Close()))
+		_, err = io.Copy(out, in)                                            // (copy_file_range on Linux: a reflink where it can)
+		check(errors.Join(err, out.Close(), os.Chmod(to, fi.Mode().Perm()))) // (whatever the umask)
 	}
 }
 
