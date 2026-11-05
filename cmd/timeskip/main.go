@@ -252,6 +252,9 @@ func main() {
 		if o.profile && o.out == "" {
 			die("--profile writes to --out DIR")
 		}
+		if o.branch != "" && !exists(o.branch) {
+			die("--branch: %s is gone: the cache keeps branch points for its last 3 runs, removes them when no run used them for 5 days, and when their setup checkpoint goes (a new kit, or a new version of the project, replaces it)", o.branch)
+		}
 		if d := filepath.Dir(abs(o.branch)); o.branch != "" && filepath.Dir(d) == filepath.Join(cache, "branches") {
 			// (Its run's branch points, which trim keeps for the last runs:
 			// they're used now, and kept while they are.)
