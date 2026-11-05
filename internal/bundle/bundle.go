@@ -403,6 +403,15 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		s.(map[string]any)["image"] = guestRef(fmt.Sprint(s.(map[string]any)["image"]))
 		delete(s.(map[string]any), "build")
 		delete(s.(map[string]any), "pull_policy")
+		// (The guest uses only the rules' targets: their paths, relative,
+		// keep the host's directory out.)
+		dev, _ := s.(map[string]any)["develop"].(map[string]any)
+		ws, _ := dev["watch"].([]any)
+		for _, w := range ws {
+			if rel, err := filepath.Rel(pdir, unescape(w.(map[string]any)["path"])); err == nil {
+				w.(map[string]any)["path"] = strings.ReplaceAll(rel, "$", "$$")
+			}
+		}
 		vs, _ := s.(map[string]any)["volumes"].([]any)
 		for _, v := range vs {
 			if m := mounts[unescape(v.(map[string]any)["source"])]; m != "" && v.(map[string]any)["type"] == "bind" {
