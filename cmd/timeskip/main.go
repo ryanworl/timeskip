@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -213,7 +214,7 @@ func main() {
 			die("usage: timeskip bundle [compose.yaml] [--no-build] [--arch arm64|amd64] -o app.tsb")
 		}
 		_, err := bundle.Create(project(pos), *arch, *out, bundle.Options{Synced: true, NoBuild: noBuild, Tmp: tempDir(), Log: os.Stdout})
-		check(err)
+		check(composeMissing(err))
 	case "test":
 		o := options{timelines: 1, jobs: cores(), drivers: 10, timeout: 3600, skip: true, faults: "high_availability", faultGap: 10}
 		fs.Func("set", "", func(v string) error { o.sets = append(o.sets, v); return nil })
@@ -341,7 +342,7 @@ func cachedBundle(project string, settings *string, prepare func()) (mine, b str
 	}
 	d := tempDir()
 	if syncs, err = bundle.Create(project, hostArch, b, bundle.Options{Cache: settings != nil, Settings: settings, NoBuild: noBuild, Tmp: d, Log: os.Stderr}); err != nil {
-		return "", "", nil, err
+		return "", "", nil, composeMissing(err)
 	}
 	mine = filepath.Join(d, "bundle.tsb")
 	if os.Link(b, mine) != nil {
@@ -501,6 +502,24 @@ func check(err error) {
 	if err != nil {
 		die("%v", err)
 	}
+}
+
+// composeMissing is err from bundling, or if Docker's Compose plugin is
+// missing (bundling reads the project with docker compose, which the
+// Docker CLI then takes for its own flags), what to do about it.
+func composeMissing(err error) error {
+	if _, noDocker := exec.LookPath("docker"); err == nil || noDocker != nil || exec.Command("docker", "compose", "version").Run() == nil {
+		return err
+	}
+	how := "your distribution's docker-compose-plugin package, or see https://docs.docker.com/compose/install/linux/"
+	if darwin {
+		prefix := "/opt/homebrew"
+		if out, _ := exec.Command("brew", "--prefix").Output(); strings.TrimSpace(string(out)) != "" {
+			prefix = strings.TrimSpace(string(out))
+		}
+		how = `brew install docker-compose, and add "cliPluginsExtraDirs": ["` + prefix + `/lib/docker/cli-plugins"] to ~/.docker/config.json`
+	}
+	return fmt.Errorf("Docker Compose isn't installed (docker compose version fails), and bundling the project needs it: install it (%s)", how)
 }
 
 // ---- small helpers ----------------------------------------------------------
