@@ -32,7 +32,13 @@ func skip(d time.Duration) error {
 		sec, nsec = sec-1, nsec+int64(time.Second)
 	}
 	tx := syscall.Timex{Modes: adjSetOffset | adjNano, Time: syscall.Timeval{Sec: sec, Usec: nsec}}
+	clockMu.Lock()
+	defer clockMu.Unlock()
+	sizes := logSizes() // (for the container logs' times: see guestTime)
 	_, err := syscall.Adjtimex(&tx)
+	if err == nil {
+		clockSteps = append(clockSteps, clockStep{uptime(), d, sizes})
+	}
 	return err
 }
 

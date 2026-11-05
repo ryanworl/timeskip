@@ -396,9 +396,12 @@ func build(c *checkpoint, b, origin string, from *checkpoint) error {
 			err = errors.New(r.Error)
 		}
 		fmt.Fprintf(os.Stderr, "timeskip: setup failed: %v\n", err)
-		keep := filepath.Join(cache, "logs", time.Now().Format("20060102-150405.000")+"-setup.log")
-		if os.MkdirAll(filepath.Dir(keep), 0o755) == nil && os.Rename(log, keep) == nil {
-			fmt.Fprintf(os.Stderr, "timeskip: its log is %s\n", keep)
+		keep := filepath.Join(cache, "logs", time.Now().Format("20060102-150405.000")+"-setup", "setup")
+		if os.MkdirAll(filepath.Dir(keep), 0o755) == nil && os.Rename(log, keep+".log") == nil {
+			fmt.Fprintf(os.Stderr, "timeskip: its log is %s.log\n", keep)
+		}
+		if containerLogs(c.file("disk"), keep+".containers.log") {
+			fmt.Fprintf(os.Stderr, "timeskip: its containers' logs are %s.containers.log\n", keep)
 		}
 		return err
 	}

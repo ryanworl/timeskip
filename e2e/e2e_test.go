@@ -108,12 +108,13 @@ type timeline struct {
 		AtMs       int64 `json:"at_ms"`
 		Checkpoint string
 	}
-	Pass     bool
-	Errors   []string
-	GuestMs  float64 `json:"guest_ms"`
-	Skips    int
-	Wall     float64 `json:"wall_s"`
-	Commands []struct {
+	Pass          bool
+	Errors        []string
+	ContainerLogs string  `json:"container_logs"`
+	GuestMs       float64 `json:"guest_ms"`
+	Skips         int
+	Wall          float64 `json:"wall_s"`
+	Commands      []struct {
 		Name  string
 		CPUMs int64 `json:"cpu_ms"`
 	}
@@ -789,6 +790,30 @@ func TestProtocol(t *testing.T) {
 					if crashed != (len(tl.Errors) > 0) {
 						t.Errorf("timeline %d: racer exited 1: %v, but errors %q", tl.Seed, crashed, tl.Errors)
 					}
+				}
+			}
+			// containerlogs.yaml: the ticker's stderr from setup, before
+			// the timeline's start; and its ticks, whose guest times less
+			// the uptime they print stay put (but for the time Docker took to
+			// read them) while the wall clock they print jumps.
+			if name == "containerlogs" && len(r.Timelines) == 1 {
+				b, _ := os.ReadFile(r.Timelines[0].ContainerLogs)
+				logs := string(b)
+				if !regexp.MustCompile(`(?m)^-\d+\.\d{3}s ticker-1 stderr ticker starts$`).MatchString(logs) {
+					t.Errorf("no stderr line from setup in the containers' logs %q:\n%.2000s", r.Timelines[0].ContainerLogs, logs)
+				}
+				var lag, jump []float64
+				for _, m := range regexp.MustCompile(`(?m)^\+(\d+\.\d{3})s ticker-1 stdout tick (\d+\.\d+) (\d+)$`).FindAllStringSubmatch(logs, -1) {
+					at, _ := strconv.ParseFloat(m[1], 64)
+					up, _ := strconv.ParseFloat(m[2], 64)
+					wall, _ := strconv.ParseFloat(m[3], 64)
+					lag, jump = append(lag, at-up), append(jump, wall-up)
+				}
+				if len(lag) < 20 {
+					t.Errorf("%d ticks in the timeline's containers' logs, want 20 or more", len(lag))
+				} else if slices.Max(lag)-slices.Min(lag) > 0.5 || slices.Max(jump)-slices.Min(jump) < 2 {
+					t.Errorf("guest time less uptime from %.3f to %.3f s (want within 0.5 s), wall clock less uptime from %.0f to %.0f s (want a jump of 2 s or more)",
+						slices.Min(lag), slices.Max(lag), slices.Min(jump), slices.Max(jump))
 				}
 			}
 			// cpu.yaml: a command's CPU time counts its child's; a sleep

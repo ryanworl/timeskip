@@ -27,8 +27,9 @@ log() { echo "[guest $(up)s] $*"; }
 # The second disk holds /var/lib/docker. Booting (for the base checkpoint, the
 # only boot) it's blank, a new file of zeros: format it, writing only the
 # metadata (and marking the inode tables zeroed, so the kernel doesn't zero
-# them later).
-mkfs.ext4 -q -F -L dockerdata -E assume_storage_prezeroed=1,nodiscard /dev/vdb
+# them later). Its last GiB of 64 is left out, for a failed timeline's
+# container logs (protocol.ContainerLogsAt).
+mkfs.ext4 -q -F -L dockerdata -E assume_storage_prezeroed=1,nodiscard /dev/vdb 63G
 mount -t ext4 -o noatime /dev/vdb /var/lib/docker
 
 log "boot complete; starting dockerd"

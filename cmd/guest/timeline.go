@@ -176,6 +176,7 @@ func (r *runner) begin(g protocol.Go) {
 	timeout := time.Duration(g.Timeout) * time.Second
 	r.stopWatchdog()
 	r.t0, r.s0, r.cpu0 = uptime(), skips(), cgroupCPU()
+	logsT0 = r.t0
 	if r.prof != nil { // (it profiled the first_ command, before a checkpoint)
 		r.prof.stop()
 		r.prof = nil
@@ -693,6 +694,17 @@ func (r *runner) finish() {
 	msg("EXIT", protocol.Exit{Kind: "timeline", Result: &protocol.Result{GuestMs: ms, Skips: skips() - r.s0,
 		Commands: commands, Assertions: assertions(), Errors: errs, Faults: faults, FaultMix: faultMix, FaultGapMs: faultGapMs, TimedOut: timedOut, ContainerCPUMs: cpu, Profile: stacks,
 		Coverage: cov, Symbols: syms, FailedMs: r.failMs}})
+	// (If it failed, the CLI asks for the containers' logs; if not, it
+	// stops the VM.)
+	if watching {
+		<-logsAsked
+	} else {
+		await("LOGS")
+	}
+	if err := dumpLogs(); err != nil {
+		say("writing the containers' logs: %v", err)
+	}
+	msg("LOGGED", struct{}{})
 }
 
 // assertions sum up the Antithesis SDK assertions' evaluations in sdk.jsonl.

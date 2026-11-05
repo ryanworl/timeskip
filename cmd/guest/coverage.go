@@ -90,6 +90,10 @@ const newEdges = ".new"
 var (
 	noting sync.Mutex
 	noted  = make(chan struct{}, 1)
+	// Watching, the host's LOGS comes to watch's reader too, which passes
+	// it on.
+	watching  bool
+	logsAsked = make(chan struct{}, 1)
 )
 
 // watch sends EDGES, for the host to branch timelines from (see README.md,
@@ -110,9 +114,14 @@ func watch(r *runner, g protocol.Go) {
 		}
 	}
 	edges, sdk := watchEdges(poke), watchSDK(r, poke)
+	watching = true
 	go func() {
 		for {
-			verb, body := await("NOTED", "BRANCH")
+			verb, body := await("NOTED", "BRANCH", "LOGS")
+			if verb == "LOGS" {
+				logsAsked <- struct{}{}
+				return
+			}
 			if verb == "BRANCH" {
 				f := protocol.Fields(body)
 				seed, _ := strconv.ParseUint(f["seed"], 10, 64)

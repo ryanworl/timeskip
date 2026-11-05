@@ -86,6 +86,9 @@ func fail(format string, a ...any) {
 	say("failed: %s", err)
 	compose("ps", "-a")
 	compose("logs", "--tail", "20")
+	if err := dumpLogs(); err != nil {
+		say("writing the containers' logs: %v", err)
+	}
 	msg("EXIT", protocol.Exit{Kind: "setup", Error: err})
 	os.Exit(1)
 }
@@ -176,6 +179,7 @@ func base() {
 // reports READY, for the host to save the VM. bundle is SETUP's bundle=.
 func setup(bundle string) {
 	setSkip(true)
+	logsT0 = uptime()
 	// (Zeroing freed pages, as from boot, so that the save holds only live
 	// memory; freeze stops it again.)
 	os.WriteFile("/sys/module/kernel/parameters/timeskip_zero_free", []byte("Y"), 0o644)

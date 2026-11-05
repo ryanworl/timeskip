@@ -1,8 +1,8 @@
 // Package protocol is the control channel between the CLI (cmd/timeskip)
 // and the guest agent (cmd/guest), as README.md describes it: lines on the
 // VM's console of the form "TS <nonce> VERB BODY". The host's verbs (SETUP,
-// GO, CONTINUE, NOTED, BRANCH) have key=value fields; the guest's (BASE, READY,
-// CHECKPOINT, EDGES, EXIT) a JSON body.
+// GO, CONTINUE, NOTED, BRANCH, LOGS) have key=value fields; the guest's (BASE,
+// READY, CHECKPOINT, EDGES, EXIT, LOGGED) a JSON body.
 package protocol
 
 import (
@@ -16,6 +16,12 @@ import (
 // BundleDir is where the guest keeps the bundle's files: mounts/ (see
 // internal/bundle) holds the files a project bind-mounts.
 const BundleDir = "/var/lib/docker/timeskip"
+
+// ContainerLogsAt is where on the data disk (of 64 GiB, Docker's filesystem
+// the first 63: see guest/init) the guest writes a failed timeline's or
+// setup's container logs: text of up to ContainerLogsSize bytes, ended by a
+// zero byte.
+const ContainerLogsAt, ContainerLogsSize = 63 << 30, 1 << 30
 
 // Line is a control line for nonce's VM.
 func Line(nonce, verb, body string) string {

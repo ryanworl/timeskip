@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -55,10 +57,12 @@ type run struct {
 	Saves    int        `json:"saves,omitempty"`  // branch points saved from it (exploring)
 	SaveS    float64    `json:"save_s,omitempty"` // ... and the wall time it was paused for them
 	protocol.Result
-	Log   string `json:"log,omitempty"`
-	i     int
-	setup bool // its edits or new images couldn't be applied
-	from  *branchPoint
+	Log string `json:"log,omitempty"`
+	// ContainerLogs are its containers' logs, if it failed.
+	ContainerLogs string `json:"container_logs,omitempty"`
+	i             int
+	setup         bool // its edits or new images couldn't be applied
+	from          *branchPoint
 }
 
 // exitOf is l's EXIT body, if it's an EXIT line.
@@ -148,8 +152,10 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 					if x != nil && p.from != nil {
 						x.done(p.from, !r.Pass)
 					}
-					if r.Pass || len(plans) == 1 { // (a log that isn't kept: see below)
+					if r.Pass { // (a log that isn't kept: see below)
 						os.RemoveAll(filepath.Dir(r.Log))
+					}
+					if r.Pass || len(plans) == 1 {
 						r.Log = ""
 					}
 					results[i] = r
@@ -167,13 +173,16 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 		x.keepFailed(results)
 	}
 	// Keep the logs of the timelines that failed (with one timeline, the
-	// console streamed).
+	// console streamed) and their containers' logs.
 	keep := filepath.Join(cache, "logs", time.Now().Format("20060102-150405.000"))
-	for i, r := range results {
-		if r.Log != "" {
-			check(os.MkdirAll(keep, 0o755))
-			results[i].Log = filepath.Join(keep, filepath.Base(filepath.Dir(r.Log))+".log")
-			check(os.Rename(r.Log, results[i].Log))
+	for i := range results {
+		for f, ext := range map[*string]string{&results[i].Log: ".log", &results[i].ContainerLogs: ".containers.log"} {
+			if *f != "" {
+				check(os.MkdirAll(keep, 0o755))
+				to := filepath.Join(keep, filepath.Base(filepath.Dir(*f))+ext)
+				check(os.Rename(*f, to))
+				*f = to
+			}
 		}
 	}
 	ok := report(results, o)
@@ -313,12 +322,21 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 				}
 				r.Wall = (time.Since(t0) - paused).Seconds()
 				r.Pass = len(r.Errors) == 0 && len(broken(r)) == 0
+				if !r.Pass {
+					v.send("LOGS", "")
+					if v.next().verb == "LOGGED" && containerLogs(data, filepath.Join(dir, "containers.log")) {
+						r.ContainerLogs = filepath.Join(dir, "containers.log")
+					}
+				}
 				if x != nil && !r.Pass {
 					x.withdraw(saved, cmp.Or(r.FailedMs, r.GuestMs))
 				}
 				return r, nil
 			case "setup":
 				r.Errors, r.setup = append(r.Errors, "setup failed: "+e.Error), true
+				if containerLogs(data, filepath.Join(dir, "containers.log")) {
+					r.ContainerLogs = filepath.Join(dir, "containers.log")
+				}
 			default:
 				die("the guest's EXIT makes no sense: %s", l.body)
 			}
@@ -326,5 +344,37 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 			r.Errors = append(r.Errors, "the VM stopped without a result")
 		}
 		return r, nil
+	}
+}
+
+// containerLogs copies the containers' logs that the guest wrote to the
+// data disk, data, to to, if it wrote any (see protocol.ContainerLogsAt).
+func containerLogs(data, to string) bool {
+	f, err := os.Open(data)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	r, buf := io.NewSectionReader(f, protocol.ContainerLogsAt, protocol.ContainerLogsSize), make([]byte, 1<<20)
+	var out *os.File
+	for {
+		n, err := r.Read(buf)
+		b, end := buf[:n], err != nil
+		if i := bytes.IndexByte(b, 0); i >= 0 {
+			b, end = b[:i], true
+		}
+		if len(b) > 0 && out == nil {
+			out, _ = os.Create(to)
+			if out == nil {
+				return false
+			}
+			defer out.Close()
+		}
+		if out != nil {
+			out.Write(b)
+		}
+		if end {
+			return out != nil
+		}
 	}
 }
