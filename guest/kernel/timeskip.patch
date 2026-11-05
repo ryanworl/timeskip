@@ -23,7 +23,7 @@
 +void timekeeping_skip(u64 nsecs);
 --- a/kernel/time/tick-sched.c
 +++ b/kernel/time/tick-sched.c
-@@ -1685,3 +1685,95 @@
+@@ -1685,3 +1685,99 @@
  	tick_nohz_switch_to_nohz();
  	return 0;
  }
@@ -39,8 +39,12 @@
 +core_param(timeskip, timeskip_enabled, bool, 0644);
 +core_param(timeskip_count, timeskip_count, ulong, 0444);
 +
-+/* Below this, a real idle period is cheaper than a skip. */
-+#define TIMESKIP_MIN_NS	(20 * NSEC_PER_USEC)
++/*
++ * Below this, the timer is as good as due. A real idle period costs the
++ * host a sleep and a wakeup (under hvrun, a WFI inside hv_vcpu_run), and
++ * with the baseline latency's timers short ones come by the thousand.
++ */
++#define TIMESKIP_MIN_NS	(1 * NSEC_PER_USEC)
 +
 +/**
 + * timeskip_idle - skip ahead to the next timer instead of idling
