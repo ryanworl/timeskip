@@ -625,8 +625,16 @@ func build(img string, b buildSpec, plat string, log io.Writer) error {
 		args = append(args, "--build-arg", k+"="+b.Args[k])
 	}
 	fmt.Fprintf(log, "building %s (%s)\n", img, plat)
-	_, err := output("docker", append(args, ctx)...)
-	return err
+	id, err := output("docker", append(args, ctx)...)
+	if err != nil {
+		return err
+	}
+	// (A builder of its own, not Docker's, keeps the image to itself, and
+	// Docker's image of that name, if any, is an old one.)
+	if got := imageID(img, plat); got != strings.TrimSpace(string(id)) {
+		return fmt.Errorf("the build of %s didn't reach Docker's images (it has %q): use a builder with the docker driver (docker buildx ls, then docker buildx use NAME; and no BUILDX_BUILDER)", img, got)
+	}
+	return nil
 }
 
 // normalizeSave re-packs a docker save archive reproducibly: docker lists
