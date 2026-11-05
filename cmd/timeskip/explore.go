@@ -14,7 +14,7 @@ import (
 	"github.com/ryanworl/timeskip/internal/protocol"
 )
 
-// Exploring (--explore; see README.md, "Exploring"): a timeline is saved,
+// Exploring (--explore; see docs/reference.md, "Exploring"): a timeline is saved,
 // as a branch point, at a moment its instrumented code reached edges that
 // no timeline of the run had, and later timelines start from branch points
 // with seeds of their own, as Antithesis branches from interesting moments.

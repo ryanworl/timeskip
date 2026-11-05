@@ -1,5 +1,5 @@
 // Package protocol is the control channel between the CLI (cmd/timeskip)
-// and the guest agent (cmd/guest), as README.md describes it: lines on the
+// and the guest agent (cmd/guest), as docs/reference.md describes it: lines on the
 // VM's console of the form "TS <nonce> VERB BODY". The host's verbs (SETUP,
 // GO, CONTINUE, NOTED, BRANCH, LOGS) have key=value fields; the guest's (BASE,
 // READY, CHECKPOINT, EDGES, EXIT, LOGGED) a JSON body.

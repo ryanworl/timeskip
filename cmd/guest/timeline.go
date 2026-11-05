@@ -115,7 +115,7 @@ var sources struct {
 }
 
 // branch makes a timeline restored from a moment of another (see
-// README.md, "Exploring") go on with seed's random numbers: its
+// docs/reference.md, "Exploring") go on with seed's random numbers: its
 // generators', the kernel's and its thread pauses'. What's drawn as it
 // comes (the next command, the next fault) is then drawn anew, and so are
 // the waits drawn before (see sleepDrawn), for the next launch, anytime_
@@ -512,7 +512,7 @@ func killTree(pid int) {
 }
 
 // drive schedules the template's commands after its first_ from the seed,
-// as the Test Composer does (see README.md, "Timelines"); with faults,
+// as the Test Composer does (see docs/reference.md, "Timelines"); with faults,
 // faults are injected until the ending (see inject). Without a template
 // (the project has none: its workload runs by itself), the timeline is its
 // faults until the timeout.

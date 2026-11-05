@@ -6,7 +6,7 @@
 // setup_complete message, reports READY with the project's test
 // templates, and on GO runs a timeline: the host's edits applied, then test
 // commands scheduled as Antithesis's Test Composer schedules them (see
-// README.md for the protocol).
+// docs/reference.md for the protocol).
 package main
 
 import (

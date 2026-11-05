@@ -20,7 +20,7 @@ import (
 	"github.com/ryanworl/timeskip/internal/protocol"
 )
 
-// Faults (GO's faults=S), as README.md's Faults describes them: a
+// Faults (GO's faults=S), as docs/reference.md's Faults describes them: a
 // baseline latency, thread pausing, network faults (partitions and clogs)
 // and, with node_faults=1 and on their own schedule, node faults (pauses, stops and
 // kills of nodes without test commands, and throttles) and CPU modulation

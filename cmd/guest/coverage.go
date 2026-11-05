@@ -96,7 +96,7 @@ var (
 	logsAsked = make(chan struct{}, 1)
 )
 
-// watch sends EDGES, for the host to branch timelines from (see README.md,
+// watch sends EDGES, for the host to branch timelines from (see docs/reference.md,
 // "Exploring"), when the timeline does something the VM hadn't since
 // watching began: instrumented code reaches edges
 // (once libvoidstar says so), or SDK assertions reach states (once

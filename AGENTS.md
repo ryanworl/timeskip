@@ -1,6 +1,6 @@
 # timeskip
 
-A CLI that runs a Docker Compose project's Antithesis-style test templates in single-vCPU Linux VMs whose patched kernel skips idle time, each timeline restored from a checkpoint. README.md is the user documentation and the spec of the project conventions, the scheduling and the host–guest control channel.
+A CLI that runs a Docker Compose project's Antithesis-style test templates in single-vCPU Linux VMs whose patched kernel skips idle time, each timeline restored from a checkpoint. README.md is the short user documentation; docs/reference.md is the full reference and the spec of the project conventions, the scheduling and the host–guest control channel.
 
 ## Build and test
 
@@ -28,6 +28,7 @@ Build steps are cached by their inputs (see `step` in `cmd/build/main.go`). Chan
 | `guest/` | The kernel patch and configs, `init`, and `libvoidstar.c`, the library the Antithesis SDKs write their output through |
 | `firecracker/` | Patches to Firecracker: a paused VM's clock stands still, and a snapshot doesn't sync its disks |
 | `examples/` | The examples the kit ships |
+| `docs/reference.md` | The full user reference: conventions, scheduling, faults, results, internals and the protocol |
 | `e2e/` | The end-to-end tests, and in `testdata/protocol` a fixture for each of the protocol's cases |
 | `install.sh` | Installs a release's kit (or one you built) |
 | `install-deps.sh`, `build.sh`, `cmd/build/`, `internal/archive/`, `deps.lock`, `test.sh` | Build dependencies, build and test |
@@ -38,8 +39,8 @@ Build steps are cached by their inputs (see `step` in `cmd/build/main.go`). Chan
 - Builds are reproducible: the same commit gives the same kit on the same kind of host (on macOS, with the same Swift toolchain, which builds `hvrun` outside the builder). Every download is pinned in `deps.lock` by SHA-256, the builder image by digest and a Debian snapshot date, and Firecracker's Rust toolchain and crates by its `rust-toolchain.toml` and `Cargo.lock` (built with `--locked`). Archives get sorted entries, root ownership and the inputs' commit time. Check a change to the build by building twice from an empty `out/` and comparing `out/*.sha256`.
 - `guest/libvoidstar.c` is mounted into every container, whatever its libc: raw system calls, no libc.
 - `guest/init` runs in BusyBox `sh` inside the VM, with no network: POSIX shell and BusyBox applets only.
-- The control channel's lines and messages are `internal/protocol`'s types, used by both the CLI (`cmd/timeskip`) and the guest agent (`cmd/guest`). The inputs' layout and the bundle's files are shared too, but not typed: change both sides together, and README.md with them. `.agents/skills/using-timeskip/SKILL.md` describes the CLI's use; keep it current too.
-- Test templates, setup_complete and assertions follow Antithesis's conventions (the Test Composer's command prefixes, `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl`), so that a project runs unchanged in both. Don't add timeskip-only conventions where Antithesis has one, and list what differs in README.md's "Differences from Antithesis".
+- The control channel's lines and messages are `internal/protocol`'s types, used by both the CLI (`cmd/timeskip`) and the guest agent (`cmd/guest`). The inputs' layout and the bundle's files are shared too, but not typed: change both sides together, and docs/reference.md with them. `.agents/skills/using-timeskip/SKILL.md` describes the CLI's use; keep it current too.
+- Test templates, setup_complete and assertions follow Antithesis's conventions (the Test Composer's command prefixes, `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl`), so that a project runs unchanged in both. Don't add timeskip-only conventions where Antithesis has one, and list what differs in docs/reference.md's "Differences from Antithesis".
 - A new protocol case (a setup failure, a kind of result) gets a fixture in `e2e/testdata/protocol` with a `# expect: N` exit code line.
 - Keep the docs short and current: describe what the project does now, not its history.
 - timeskip is not a security boundary; don't describe or design it as one.
