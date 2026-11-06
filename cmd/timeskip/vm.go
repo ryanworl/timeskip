@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,10 +39,12 @@ type vm struct {
 	cut        chan struct{} // when closed, next returns CUT, as the run stops early (--max-failures)
 	client     *http.Client
 	killed     atomic.Bool // by kill
+	mu         sync.Mutex
+	lastErr    string // the VMM's last line on stderr (see nextLine; on mu)
 }
 
 type ctlLine struct {
-	verb string // EXITED when the VMM exited without a guest EXIT line; CUT (see vm.cut)
+	verb string // EXITED when the VMM exited without a guest EXIT line (body: how it failed, if it did; see nextLine); CUT (see vm.cut)
 	body string
 }
 
@@ -188,6 +191,9 @@ func start(dir, nonce string, disks []disk, share string, from *checkpoint, data
 			if l := s.Text(); l == "hvrun: saved" {
 				v.saved <- struct{}{}
 			} else {
+				v.mu.Lock()
+				v.lastErr = l
+				v.mu.Unlock()
 				fmt.Fprintln(log, l)
 			}
 		}
@@ -232,13 +238,14 @@ func start(dir, nonce string, disks []disk, share string, from *checkpoint, data
 			}
 			if time.Since(t) > 10*time.Second {
 				showTail(v.file("console.log"), 20)
+				v.keepLog()
 				die("firecracker didn't start")
 			}
 		}
-		check(v.api("PUT", "/snapshot/load", map[string]any{"snapshot_path": from.file("state"),
+		v.check(v.api("PUT", "/snapshot/load", map[string]any{"snapshot_path": from.file("state"),
 			"mem_backend": map[string]string{"backend_type": "File", "backend_path": from.file("mem")}, "track_dirty_pages": track, "resume_vm": false, "huge_pages": "None"}))
 		v.drives(data, cmp.Or(img, from.placeholder()))
-		check(v.api("PATCH", "/vm", map[string]string{"state": "Resumed"}))
+		v.check(v.api("PATCH", "/vm", map[string]string{"state": "Resumed"}))
 	}
 	return v
 }
@@ -263,6 +270,27 @@ func (v *vm) file(name string) string { return filepath.Join(v.dir, name) }
 // powered off, is a harness error. Once exit began, a VMM that exits was
 // killed for it, and next never returns.
 func (v *vm) next() ctlLine {
+	l := v.nextLine()
+	if l.verb == "EXITED" && l.body != "" {
+		showTail(v.file("console.log"), 20)
+		v.keepLog()
+		die("%s", l.body)
+	}
+	return l
+}
+
+// keepLog keeps the console log of a VM whose failure ends the run in the
+// cache's logs, as a failed timeline's is kept, and says where.
+func (v *vm) keepLog() {
+	keep := filepath.Join(cache, "logs", time.Now().Format("20060102-150405.000"), filepath.Base(v.dir)+".log")
+	if os.MkdirAll(filepath.Dir(keep), 0o755) == nil && os.Rename(v.file("console.log"), keep) == nil {
+		fmt.Fprintf(os.Stderr, "timeskip: its log is %s\n", keep)
+	}
+}
+
+// nextLine is next for a timeline, which a VMM's failure fails alone: its
+// EXITED line's body says how the VMM failed.
+func (v *vm) nextLine() ctlLine {
 	var l ctlLine
 	select {
 	case l = <-v.ctl:
@@ -273,8 +301,12 @@ func (v *vm) next() ctlLine {
 		select {}
 	}
 	if l.verb == "EXITED" && !v.killed.Load() && !v.cmd.ProcessState.Success() {
-		showTail(v.file("console.log"), 20)
-		die("the VMM stopped (%s)", v.cmd.ProcessState)
+		v.mu.Lock()
+		l.body = fmt.Sprintf("the VMM stopped (%s)", v.cmd.ProcessState)
+		if v.lastErr != "" {
+			l.body += ", its last words: " + v.lastErr
+		}
+		v.mu.Unlock()
 	}
 	return l
 }
@@ -301,6 +333,7 @@ func (v *vm) save(dir, data, img, placeholder string, diff bool) {
 		case <-v.saved:
 		case l := <-v.ctl:
 			showTail(v.file("console.log"), 20)
+			v.keepLog()
 			die("the VM stopped while being saved (%s)", l.verb)
 		}
 		if data != disk {
@@ -310,7 +343,7 @@ func (v *vm) save(dir, data, img, placeholder string, diff bool) {
 	}
 	// (A diff snapshot without dirty-page tracking, of a booted VM, saves
 	// the pages it touched: the rest is zero, a hole in the file.)
-	check(v.api("PATCH", "/vm", map[string]string{"state": "Paused"}))
+	v.check(v.api("PATCH", "/vm", map[string]string{"state": "Paused"}))
 	mem := filepath.Join(dir, "mem")
 	if diff {
 		mem += ".diff"
@@ -323,7 +356,7 @@ func (v *vm) save(dir, data, img, placeholder string, diff bool) {
 	}
 	// (Unsynced: a crash leaves a checkpoint without its "done" file, which
 	// is then made again. publish syncs it.)
-	check(v.api("PUT", "/snapshot/create", map[string]any{"snapshot_type": "Diff", "sync_snapshot_files": false,
+	v.check(v.api("PUT", "/snapshot/create", map[string]any{"snapshot_type": "Diff", "sync_snapshot_files": false,
 		"snapshot_path": filepath.Join(dir, "state"), "mem_file_path": mem}))
 }
 
@@ -341,13 +374,22 @@ func (v *vm) resume() {
 		fmt.Fprintln(v.stdin, "@resume")
 		return
 	}
-	check(v.api("PATCH", "/vm", map[string]string{"state": "Resumed"}))
+	v.check(v.api("PATCH", "/vm", map[string]string{"state": "Resumed"}))
 }
 
 // drives points a Firecracker VM's data (d1) and inputs (d2) drives at files.
 func (v *vm) drives(data, inputs string) {
-	check(v.api("PATCH", "/drives/d1", map[string]string{"drive_id": "d1", "path_on_host": data}))
-	check(v.api("PATCH", "/drives/d2", map[string]string{"drive_id": "d2", "path_on_host": inputs}))
+	v.check(v.api("PATCH", "/drives/d1", map[string]string{"drive_id": "d1", "path_on_host": data}))
+	v.check(v.api("PATCH", "/drives/d2", map[string]string{"drive_id": "d2", "path_on_host": inputs}))
+}
+
+// check is check for a call to Firecracker's API, which fails if it
+// failed: its log is kept first.
+func (v *vm) check(err error) {
+	if err != nil {
+		v.keepLog()
+		check(err)
+	}
 }
 
 // kill kills the VMM and waits for it, and for its console to be logged.

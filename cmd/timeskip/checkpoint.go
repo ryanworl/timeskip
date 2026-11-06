@@ -381,7 +381,7 @@ func build(c *checkpoint, b, origin string, from *checkpoint) error {
 	} else {
 		st, err := os.Stat(c.bundle())
 		check(err)
-		check(v.api("PATCH", "/drives/d0", map[string]string{"drive_id": "d0", "path_on_host": c.bundle()}))
+		v.check(v.api("PATCH", "/drives/d0", map[string]string{"drive_id": "d0", "path_on_host": c.bundle()}))
 		v.send("SETUP", fmt.Sprintf("bundle=blk:%d", st.Size()))
 	}
 	l := v.next()

@@ -116,6 +116,7 @@ type timeline struct {
 	Pass          bool
 	NotRun        bool `json:"not_run"`
 	Errors        []string
+	Log           string
 	ContainerLogs string  `json:"container_logs"`
 	GuestMs       float64 `json:"guest_ms"`
 	Skips         int
@@ -1131,6 +1132,48 @@ func TestCleanup(t *testing.T) {
 		if l := leftovers(); len(l) > 0 {
 			t.Errorf("%s: left %v", c.name, l)
 		}
+	}
+	// A VMM killed as a timeline runs (as the OOM killer might) fails that
+	// timeline alone: the run goes on, reports it with how the VMM stopped
+	// and keeps its log.
+	vmmOut := filepath.Join(work, "cleanup-vmm.out")
+	os.RemoveAll(vmmOut)
+	log, _ := os.Create(filepath.Join(work, "cleanup-vmm.log"))
+	cmd := exec.Command(ts, "test", f, "--timelines", "4", "-j", "2", "--set", "faults=none", "--out", vmmOut)
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	killed := false
+	for t1 := time.Now(); !killed && time.Since(t1) < time.Minute; time.Sleep(100 * time.Millisecond) {
+		// (A timeline's VMM: the setup checkpoint is made by now.)
+		b, _ := exec.Command("pgrep", "-f", "-P", fmt.Sprint(cmd.Process.Pid), "bin/firecracker|bin/hvrun.* --share ").Output()
+		if f := strings.Fields(string(b)); len(f) > 0 {
+			pid, _ := strconv.Atoi(f[0])
+			killed = syscall.Kill(pid, syscall.SIGKILL) == nil
+		}
+	}
+	cmd.Wait()
+	log.Close()
+	var vr result
+	b, _ := os.ReadFile(filepath.Join(vmmOut, "results.json"))
+	json.Unmarshal(b, &vr)
+	failed := 0
+	for _, tl := range vr.Timelines {
+		if len(tl.Errors) > 0 && strings.HasPrefix(tl.Errors[0], "the VMM stopped (signal: killed)") {
+			failed++
+			if _, err := os.Stat(tl.Log); tl.Log == "" || err != nil {
+				t.Errorf("the failed timeline's log %q wasn't kept", tl.Log)
+			}
+		} else if len(tl.Errors) > 0 || tl.NotRun {
+			t.Errorf("timeline seed=%d: errors %q, not run %v", tl.Seed, tl.Errors, tl.NotRun)
+		}
+	}
+	if rc := cmd.ProcessState.ExitCode(); !killed || rc != 1 || len(vr.Timelines) != 4 || failed != 1 {
+		t.Errorf("a VMM killed: killed %v, exit %d, %d timelines, %d failed by it; want exit 1, 4 timelines, 1", killed, rc, len(vr.Timelines), failed)
+	}
+	if l := leftovers(); len(l) > 0 {
+		t.Errorf("a VMM killed: left %v", l)
 	}
 	// A run killed with SIGKILL leaves its files, which the next run
 	// removes once they're a minute old.

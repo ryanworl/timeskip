@@ -298,7 +298,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 	close(base.made)
 	defer func() { <-base.made; x.release(base.point) }()
 	for {
-		l := v.next()
+		l := v.nextLine()
 		switch l.verb {
 		case "CUT":
 			r.NotRun = true
@@ -333,8 +333,11 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 				r.Pass = len(r.Errors) == 0 && len(broken(r)) == 0
 				if !r.Pass {
 					v.send("LOGS", "")
-					if v.next().verb == "LOGGED" && containerLogs(data, filepath.Join(dir, "containers.log")) {
+					switch l := v.nextLine(); {
+					case l.verb == "LOGGED" && containerLogs(data, filepath.Join(dir, "containers.log")):
 						r.ContainerLogs = filepath.Join(dir, "containers.log")
+					case l.verb == "EXITED" && l.body != "":
+						r.Errors = append(r.Errors, l.body)
 					}
 				}
 				if x != nil && !r.Pass {
@@ -349,8 +352,8 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 			default:
 				die("the guest's EXIT makes no sense: %s", l.body)
 			}
-		default: // EXITED
-			r.Errors = append(r.Errors, "the VM stopped without a result")
+		default: // EXITED (the VMM's failure fails only this timeline)
+			r.Errors = append(r.Errors, cmp.Or(l.body, "the VM stopped without a result"))
 		}
 		return r, nil
 	}
