@@ -30,7 +30,7 @@ The details behind [README.md](../README.md): the project conventions, the sched
 
 ## Timelines
 
-`timeskip test` runs `--timelines N` timelines of each template (default 1; `--template NAME` picks templates), up to `-j` at a time (default: one per CPU core, and never more for all the runs on the host together, as a VM that waits for a core waits in guest time (see How it works), and two VMs on one core's hardware threads each take up to twice the CPU time; on macOS, one per performance core). A timeline's seed (the first is `--seed`, or random; the next ones count up) chooses its schedule, as the Test Composer does:
+`timeskip test` runs `--timelines N` timelines of each template (default 1; `--template NAME` picks templates), up to `-j` at a time (default: one per CPU core, and never more for all the runs on the host together, as a VM that waits for a core waits in guest time (see How it works), and two VMs on one core's hardware threads each take up to twice the CPU time; on macOS, one per performance core, super cores included). A timeline's seed (the first is `--seed`, or random; the next ones count up) chooses its schedule, as the Test Composer does:
 
 - one of the template's `first_` commands, before anything else;
 - then either one `singleton_driver_`, the only driver, or `drivers` (default 10) launches of `parallel_driver_` commands (in the background) and `serial_driver_` ones (alone), with random pauses of up to 0.5 s between them;

@@ -2,20 +2,35 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
 	"syscall"
 )
 
-// cores is the number of performance cores: an efficiency core takes two
-// or three times the CPU time for the same work.
+// cores is the number of performance cores: those of every perflevel but
+// the last, the efficiency cores, which take two or three times the CPU
+// time for the same work (an M6 has two levels above them: 2 super and 4
+// performance cores).
 func cores() int {
-	b, err := syscall.Sysctl("hw.perflevel0.physicalcpu")
-	if err != nil || len(b) > 4 {
+	n := 0
+	for i := range max(1, sysctlInt("hw.nperflevels")-1) {
+		n += sysctlInt(fmt.Sprintf("hw.perflevel%d.physicalcpu", i))
+	}
+	if n == 0 {
 		return runtime.NumCPU()
 	}
-	return max(1, int(binary.LittleEndian.Uint32([]byte(b+"\x00\x00\x00\x00"))))
+	return n
+}
+
+// sysctlInt is a 32-bit sysctl's value, or 0.
+func sysctlInt(name string) int {
+	b, err := syscall.Sysctl(name)
+	if err != nil || len(b) > 4 {
+		return 0
+	}
+	return int(binary.LittleEndian.Uint32([]byte(b + "\x00\x00\x00\x00")))
 }
 
 // clone copies file src to dst: a copy-on-write clone (APFS).
