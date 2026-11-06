@@ -141,15 +141,18 @@ func main() {
 
 // step runs fn, logging to out/log-NAME, unless its inputs are unchanged
 // since its last run. Its inputs are the repository paths in paths (plus
-// common) and the files in out/ named in outs.
+// common) and the files in out/ named in outs. fn's sde, the time its
+// outputs are stamped with, is the last commit's to paths alone: a change
+// to the build itself (common) that leaves what a step makes the same
+// leaves its bytes the same (the kernel's banner, the rootfs's times).
 func step(t target, name string, paths, outs []string, fn func(t target, log io.Writer, sde int64) error) error {
 	start := time.Now()
-	paths = append(paths, common...)
 	sdeOut, err := git(append([]string{"log", "-1", "--format=%ct", "--"}, paths...)...)
 	if err != nil {
 		return err
 	}
 	sde, _ := strconv.ParseInt(strings.TrimSpace(sdeOut), 10, 64)
+	paths = append(paths, common...)
 	files, err := git(append([]string{"ls-files", "-co", "--exclude-standard", "--"}, paths...)...)
 	if err != nil {
 		return err
