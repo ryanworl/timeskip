@@ -123,7 +123,13 @@ func main() {
 	commit, err := git("rev-parse", "HEAD")
 	must(err)
 	source := strings.TrimSpace(version) + "\n" + strings.TrimSpace(commit)
-	if st, _ := git("status", "--porcelain"); st != "" {
+	// Only changes to what the build reads count (hvrun is built by
+	// build.sh, from hv/): a file elsewhere (notes, a project under docs/)
+	// would make the kit, whose inputs include this text, another kit,
+	// whose checkpoints and replays aren't this one's.
+	inputs := append([]string{"status", "--porcelain", "--", "guest", "firecracker", "cmd", "internal", "e2e",
+		"examples", "hv", "build.sh", ".gitignore", "LICENSE", "THIRD_PARTY.md", "licenses"}, common...)
+	if st, _ := git(inputs...); st != "" {
 		source += " (with uncommitted changes)"
 	}
 	must(os.WriteFile(out+"/.source", []byte(source), 0o644))
