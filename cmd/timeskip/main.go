@@ -275,6 +275,9 @@ func main() {
 		var edits []edit
 		var setup *checkpoint
 		if f := abs(project(pos)); bundle.Files(f) != nil {
+			if _, cached := bundle.Files(f)["pulled"]; cached {
+				fmt.Fprintf(os.Stderr, "timeskip: warning: %s is a project's bundle from the cache, without the project's x-timeskip settings and sync rules: it runs with the default settings (and --set's), so a seed may run otherwise than in the project; to replay a seed of the project, test the project\n", f)
+			}
 			settings(bundleFile(f, "settings"), o.sets, &o)
 			setup = mustSetup(setupCheckpoint(f, f))
 			edits = syncedEdits(f)
