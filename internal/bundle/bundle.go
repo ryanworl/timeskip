@@ -29,6 +29,7 @@ import (
 	"cmp"
 	"compress/gzip"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +38,10 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -489,6 +493,9 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		if err := normalizeSave(filepath.Join(dir, name), filepath.Join(tmp, "img-"+a), q, tags); err != nil {
 			return nil, err
 		}
+		for _, w := range sdkWithoutCgo(filepath.Join(tmp, "img-"+a)) {
+			fmt.Fprintf(log, "warning: %s links the Antithesis Go SDK but was built without cgo (CGO_ENABLED=0): for linux/amd64, as in Antithesis, the SDK then fails its \"Go application under test compiled with CGO enabled\" in every timeline (for arm64 it doesn't, so a run on a Mac passes); build it with cgo\n", w)
+		}
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
@@ -627,6 +634,13 @@ func build(img string, b buildSpec, plat string, log io.Writer) error {
 	fmt.Fprintf(log, "building %s (%s)\n", img, plat)
 	id, err := output("docker", append(args, ctx)...)
 	if err != nil {
+		// (A base image for another platform runs, and fails as a command
+		// does, with no word of why: Docker's checks say.)
+		check := append([]string{"build", "--check"}, args[len(buildPolicy)+2:]...)
+		out, _ := exec.Command("docker", append(check, ctx)...).CombinedOutput()
+		for _, m := range basePlatform.FindAllStringSubmatch(string(out), -1) {
+			err = fmt.Errorf("%v\n%s", err, otherPlatform(m[1], m[3], m[2]))
+		}
 		return err
 	}
 	// (A builder of its own, not Docker's, keeps the image to itself, and
@@ -635,6 +649,16 @@ func build(img string, b buildSpec, plat string, log io.Writer) error {
 		return fmt.Errorf("the build of %s didn't reach Docker's images (it has %q): use a builder with the docker driver (docker buildx ls, then docker buildx use NAME; and no BUILDX_BUILDER)", img, got)
 	}
 	return nil
+}
+
+// basePlatform finds, in docker build --check's output, a base image for
+// another platform than the build's: image, its platform, the build's.
+var basePlatform = regexp.MustCompile(`Base image (\S+) was pulled with platform "([^"]+)", expected "([^"]+)"`)
+
+// otherPlatform says that image img, pinned by a digest, isn't for platform
+// plat (it's for has).
+func otherPlatform(img, plat, has string) string {
+	return fmt.Sprintf("%s has no %s variant (it's %s): its digest names one platform's image, not the multi-arch index; pin the index's digest (docker buildx imagetools inspect IMAGE:TAG prints it)", img, plat, has)
 }
 
 // normalizeSave re-packs a docker save archive reproducibly: docker lists
@@ -730,6 +754,99 @@ func inflate(dir string) error {
 		}
 	}
 	return nil
+}
+
+// sdkWithoutCgo lists the Go programs in an extracted docker save
+// archive's images (inflated) that link the Antithesis Go SDK, built
+// without cgo: "IMAGE: PATH". Only the files an image's containers see
+// count: a layer's files that no layer above replaces or deletes.
+func sdkWithoutCgo(dir string) []string {
+	b, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	var m []struct {
+		RepoTags []string
+		Layers   []string
+	}
+	json.Unmarshal(b, &m)
+	var found []string
+	for _, e := range m {
+		img := strings.Join(e.RepoTags, ", ")
+		// (From the top layer down: what a layer has replaces what the
+		// layers below have at that path, and, but for a directory, what
+		// they have under it; a whiteout hides what it names, and an
+		// opaque whiteout what its directory had below.)
+		seen, gone, opaque := map[string]bool{}, map[string]bool{}, map[string]bool{}
+		hidden := func(p string) bool {
+			if seen[p] || gone[p] {
+				return true
+			}
+			for d := path.Dir(p); ; d = path.Dir(d) {
+				if gone[d] || opaque[d] {
+					return true
+				}
+				if d == "." {
+					return false
+				}
+			}
+		}
+		for i := len(e.Layers) - 1; i >= 0; i-- {
+			f, err := os.Open(filepath.Join(dir, e.Layers[i]))
+			if err != nil {
+				continue
+			}
+			var have, hide, opq []string
+			r := tar.NewReader(f)
+			for {
+				h, err := r.Next()
+				if err != nil {
+					break
+				}
+				name := path.Clean(strings.TrimPrefix(h.Name, "/"))
+				d, base := path.Split(name)
+				switch {
+				case base == ".wh..wh..opq":
+					opq = append(opq, path.Clean(d))
+					continue
+				case strings.HasPrefix(base, ".wh."):
+					hide = append(hide, path.Join(d, strings.TrimPrefix(base, ".wh.")))
+					continue
+				}
+				// (An entry that a layer above hides still hides what's
+				// below it.)
+				if have = append(have, name); h.Typeflag != tar.TypeDir {
+					hide = append(hide, name)
+				}
+				if hidden(name) || h.Typeflag != tar.TypeReg || h.Mode&0o111 == 0 || h.Size < 4 {
+					continue
+				}
+				// (tar.Reader reads no further than the header: the file's
+				// data starts here.)
+				at, _ := f.Seek(0, io.SeekCurrent)
+				bi, err := buildinfo.Read(io.NewSectionReader(f, at, h.Size))
+				if err != nil {
+					continue
+				}
+				settings := map[string]string{}
+				for _, s := range bi.Settings {
+					settings[s.Key] = s.Value
+				}
+				sdk := slices.ContainsFunc(bi.Deps, func(d *debug.Module) bool { return d.Path == "github.com/antithesishq/antithesis-sdk-go" })
+				if sdk && settings["CGO_ENABLED"] == "0" && settings["GOOS"] == "linux" && !slices.Contains(strings.Split(settings["-tags"], ","), "no_antithesis_sdk") {
+					found = append(found, img+": /"+name)
+				}
+			}
+			f.Close()
+			for _, p := range have {
+				seen[p] = true
+			}
+			for _, p := range hide {
+				gone[p] = true
+			}
+			for _, p := range opq {
+				opaque[p] = true
+			}
+		}
+	}
+	return found
 }
 
 func inflateFile(path string) error {
@@ -962,13 +1079,22 @@ func pull(img, plat string, policies []string, log io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(log, "pulling %s (%s)\n", img, plat)
-	_, err := output("docker", "pull", "-q", "--platform", plat, img)
-	return err
+	if _, err := output("docker", "pull", "-q", "--platform", plat, img); err != nil {
+		return err
+	}
+	// (Docker pulls a digest that names one platform's image whatever its
+	// platform.)
+	if _, err := output("docker", "image", "inspect", "--platform", plat, img); err != nil && strings.Contains(err.Error(), "does not provide the specified platform") {
+		has, _ := output("docker", "image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", img)
+		return errors.New(otherPlatform(img, plat, strings.TrimSpace(string(has))))
+	}
+	return nil
 }
 
-// noPlatform says whether err is a registry's: no image for that platform.
+// noPlatform says whether err is a registry's, or pull's: no image for that
+// platform.
 func noPlatform(err error) bool {
-	return strings.Contains(err.Error(), "no matching manifest") || strings.Contains(err.Error(), "does not match the specified platform")
+	return strings.Contains(err.Error(), "no matching manifest") || strings.Contains(err.Error(), "does not match the specified platform") || strings.Contains(err.Error(), "its digest names one platform's image")
 }
 
 // mustPull says whether to pull img, given the pull_policy of each service
