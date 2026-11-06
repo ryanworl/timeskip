@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ryanworl/timeskip/internal/protocol"
@@ -220,14 +223,24 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 		x.keepFailed(results)
 	}
 	// Keep the logs of the timelines that failed (with one timeline, the
-	// console streamed) and their containers' logs.
-	keep := filepath.Join(cache, "logs", time.Now().Format("20060102-150405.000"))
+	// console streamed) and their containers' logs: with --out, with the
+	// results, where the cache's trim doesn't reach them.
+	// With --out, in a directory of this run's own under DIR/logs, so that
+	// runs into the same DIR don't overwrite each other's.
+	stamp := time.Now().Format("20060102-150405.000")
+	keep := filepath.Join(cache, "logs", stamp)
+	if o.out != "" {
+		keep = ""
+	}
 	for i := range results {
 		for f, ext := range map[*string]string{&results[i].Log: ".log", &results[i].ContainerLogs: ".containers.log"} {
 			if *f != "" {
+				if keep == "" {
+					keep = newDir(filepath.Join(o.out, "logs", stamp))
+				}
 				check(os.MkdirAll(keep, 0o755))
 				to := filepath.Join(keep, filepath.Base(filepath.Dir(*f))+ext)
-				check(os.Rename(*f, to))
+				check(move(*f, to))
 				*f = to
 			}
 		}
@@ -389,4 +402,54 @@ func containerLogs(data, to string) bool {
 			return out != nil
 		}
 	}
+}
+
+// newDir creates and returns directory base, or base-2, base-3 and so on if
+// it exists.
+func newDir(base string) string {
+	check(os.MkdirAll(filepath.Dir(base), 0o755))
+	for i := 1; ; i++ {
+		d := base
+		if i > 1 {
+			d = fmt.Sprintf("%s-%d", base, i)
+		}
+		err := os.Mkdir(d, 0o755)
+		if err == nil {
+			return d
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			check(err)
+		}
+	}
+}
+
+// move renames file from to to, or where they're on different filesystems
+// (--out's and the cache's), copies it to a temporary name beside to,
+// renames that to to, and only then removes from.
+func move(from, to string) error {
+	err := os.Rename(from, to)
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	in, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.CreateTemp(filepath.Dir(to), "."+filepath.Base(to)+".*")
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if fi, serr := in.Stat(); serr == nil {
+		err = errors.Join(err, out.Chmod(fi.Mode()))
+	}
+	if err = errors.Join(err, out.Close()); err == nil {
+		err = os.Rename(out.Name(), to)
+	}
+	if err != nil {
+		os.Remove(out.Name())
+		return err
+	}
+	return os.Remove(from)
 }
