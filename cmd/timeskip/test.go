@@ -140,6 +140,11 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 	// (--max-failures: once enough timelines failed, the others don't
 	// start, and those running stop: see vm.next.)
 	enough, failures := make(chan struct{}), 0
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(enough) }) }
+	interrupt.Lock()
+	interrupt.stop = stop
+	interrupt.Unlock()
 	var x *explorer
 	if o.explore && replay == nil {
 		x = newExplorer(o)
@@ -181,7 +186,7 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 					mu.Lock()
 					if o.maxFailures > 0 && countsAsFailure(r, o) {
 						if failures++; failures == o.maxFailures {
-							close(enough)
+							stop()
 						}
 					}
 					mu.Unlock()
@@ -207,6 +212,10 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 		})
 	}
 	wg.Wait()
+	interrupt.Lock()
+	interrupt.stop = nil // (from here on, a signal exits at once)
+	interrupted := interrupt.signaled
+	interrupt.Unlock()
 	if x != nil {
 		x.keepFailed(results)
 	}
@@ -228,6 +237,9 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 		fmt.Fprintf(os.Stderr, "timeskip: the failed timelines' logs are in %s\n", keep)
 	}
 	trim()
+	if interrupted {
+		exit(130)
+	}
 	if !ok {
 		if !slices.ContainsFunc(results, func(r run) bool { return !r.setup && !r.NotRun }) {
 			exit(125)

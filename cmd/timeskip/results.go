@@ -137,7 +137,10 @@ func report(runs []run, o options) bool {
 	passed, notRun := 0, 0
 	for _, r := range runs {
 		if r.NotRun {
-			fmt.Fprintf(os.Stderr, "timeline %s#%d seed=%d not run (--max-failures)\n", r.Template, r.i, r.Seed)
+			interrupt.Lock()
+			why := map[bool]string{false: "--max-failures", true: "interrupted"}[interrupt.signaled]
+			interrupt.Unlock()
+			fmt.Fprintf(os.Stderr, "timeline %s#%d seed=%d not run (%s)\n", r.Template, r.i, r.Seed, why)
 			notRun++
 			continue
 		}

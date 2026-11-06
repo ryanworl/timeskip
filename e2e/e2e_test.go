@@ -1115,9 +1115,18 @@ func TestCleanup(t *testing.T) {
 		sig   syscall.Signal
 		group bool
 	}{{"ctrl-c", syscall.SIGINT, true}, {"sigterm", syscall.SIGTERM, false}, {"sighup", syscall.SIGHUP, false}} {
+		// (Once the timelines run, it stops the run as --max-failures does,
+		// reporting the timelines that ended; before, it exits at once.)
 		rc, out := stop("cleanup-"+c.name, c.sig, c.group)
-		if rc != 130 || strings.Contains(out, "timeskip: ") {
-			t.Errorf("%s: exit %d, output ending %q; want 130 and no errors", c.name, rc, out[max(0, len(out)-300):])
+		var errs []string
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(l, "timeskip: ") && !strings.HasPrefix(l, "timeskip: stopping: ") && !strings.Contains(l, " timelines passed, ") && !strings.HasPrefix(l, "timeskip: the failed timelines' logs are in ") {
+				errs = append(errs, l)
+			}
+		}
+		stopped := strings.Contains(out, "timeskip: stopping: ")
+		if rc != 130 || len(errs) > 0 || stopped && !strings.Contains(out, "not run (interrupted)") {
+			t.Errorf("%s: exit %d, output ending %q; want 130, no errors (%q), and if it stopped the run, the timelines not run", c.name, rc, out[max(0, len(out)-300):], errs)
 		}
 		if l := leftovers(); len(l) > 0 {
 			t.Errorf("%s: left %v", c.name, l)

@@ -195,6 +195,15 @@ func main() {
 	go func() {
 		<-sig
 		go func() { <-sig; os.Exit(130) }() // (a second one doesn't wait for the cleanups)
+		interrupt.Lock()
+		interrupt.signaled = true
+		stop := interrupt.stop
+		interrupt.Unlock()
+		if stop != nil {
+			fmt.Fprintln(os.Stderr, "timeskip: stopping: the timelines that ended will be reported (again to quit at once)")
+			stop()
+			return
+		}
 		exit(130)
 	}()
 
@@ -447,6 +456,16 @@ func parse(fs *flag.FlagSet, args []string, n int) []string {
 }
 
 // ---- exiting ----------------------------------------------------------------
+
+// interrupt: while a test run's timelines run, the first signal calls stop,
+// which stops the run as --max-failures does, so that the timelines that
+// ended are reported (and their logs kept) before it exits 130; otherwise
+// it exits at once.
+var interrupt struct {
+	sync.Mutex
+	stop     func()
+	signaled bool
+}
 
 var (
 	mu       sync.Mutex
