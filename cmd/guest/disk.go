@@ -454,6 +454,9 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 				if err := os.Remove(d.dir + "/full"); err != nil && !os.IsNotExist(err) {
 					errs = append(errs, err)
 				}
+				// (Committed, so that a power loss soon after doesn't
+				// bring the file back, and the disk stays full for good.)
+				errs = append(errs, syncDir(d.dir))
 				d.mu.Unlock()
 			}
 			return errors.Join(errs...)
@@ -713,7 +716,18 @@ func (d *disk) fill() error {
 			n /= 2
 		}
 	}
-	return nil
+	// (Committed, so that a power loss meanwhile doesn't free the space.)
+	return errors.Join(f.Sync(), syncDir(d.dir))
+}
+
+// syncDir commits what changed in directory dir (its entries).
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // reboot kills the running containers of d's node, remounts d (see
