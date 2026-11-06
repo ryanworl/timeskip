@@ -1127,7 +1127,45 @@ func (in *injector) restart(c container) error {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 	}
-	if err := call("POST", "/containers/"+c.ID+"/start", nil, nil); err != nil && !strings.Contains(err.Error(), "cannot start a paused container") {
+	return in.start(c, d)
+}
+
+// claimedStart starts container c, whose death a disk fault claimed (its
+// state as it saw it), again, unless something took it over since: a
+// node fault that took it down (its heal starts it), another start (it
+// isn't that death's any more), or a disk fault that has its disk now
+// (which starts it as it heals). (Holding its disk's lock and r.own, so
+// that neither a node fault nor a disk fault comes between the check and
+// the start.) It's whether it started.
+func (in *injector) claimedStart(c container) (bool, error) {
+	d := disks[c.ID]
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	in.r.own.Lock()
+	defer in.r.own.Unlock()
+	var now container
+	if err := call("GET", "/containers/"+c.ID+"/json", nil, &now); err != nil {
+		return false, err
+	}
+	switch {
+	case in.r.isDown(c.ID):
+		say("fault: %s is left to the node fault that took it down", c.Name)
+		return false, nil
+	case now.State.Status != "exited" || now.State.FinishedAt != c.State.FinishedAt:
+		return false, nil
+	case d.faulty > 0:
+		say("fault: %s starts once its disk heals", c.Name)
+		d.deaths = append(d.deaths, c)
+		return false, nil
+	}
+	return true, in.start(c, d)
+}
+
+// start starts container c (see restart), with its disk d's lock held, if
+// it has one.
+func (in *injector) start(c container, d *disk) error {
+	err := call("POST", "/containers/"+c.ID+"/start", nil, nil)
+	if err != nil && !strings.Contains(err.Error(), "cannot start a paused container") {
 		// (On a failing or full disk, Docker may fail to start it: it's
 		// started as the disk heals.)
 		if d != nil && d.faulty > 0 {

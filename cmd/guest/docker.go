@@ -73,8 +73,9 @@ func do(method, path, ctype string, body io.Reader) (*http.Response, error) {
 // the signals Docker sent them, from its kill events.
 var exits struct {
 	sync.Mutex
-	once sync.Once
-	l    []exit
+	once    sync.Once
+	l       []exit
+	started map[string]int // where each container's latest start came, in l (see claimDeath)
 }
 
 // exit is a container's exit, fault if a fault caused it (see claimExit
@@ -82,6 +83,8 @@ var exits struct {
 type exit struct {
 	id, name, code string
 	fault, kill    bool
+	taken          bool // matched to a crash (see takeExit)
+	boot           int  // a disk fault's reboot's kill: the kernel log's sequence number before it, plus 1 (see markBoot)
 }
 
 // unexpected is whether e counts as Antithesis's "No unexpected container
@@ -99,7 +102,7 @@ func (e exit) String() string { return e.name + " exited with code " + e.code }
 // watchExits records the exits from now on, from Docker's events.
 func watchExits() {
 	exits.once.Do(func() {
-		f, _ := json.Marshal(map[string][]string{"type": {"container"}, "event": {"die", "kill"}, "label": {"com.docker.compose.project=" + project}})
+		f, _ := json.Marshal(map[string][]string{"type": {"container"}, "event": {"die", "kill", "start"}, "label": {"com.docker.compose.project=" + project}})
 		resp, err := do("GET", "/events?filters="+url.QueryEscape(string(f)), "", nil)
 		check(err)
 		go func() {
@@ -116,7 +119,14 @@ func watchExits() {
 				}
 				a := e.Actor.Attributes
 				exits.Lock()
-				exits.l = append(exits.l, exit{id: e.Actor.ID, name: a["name"], code: a["exitCode"], kill: e.Action == "kill"})
+				if e.Action == "start" {
+					if exits.started == nil {
+						exits.started = map[string]int{}
+					}
+					exits.started[e.Actor.ID] = len(exits.l)
+				} else {
+					exits.l = append(exits.l, exit{id: e.Actor.ID, name: a["name"], code: a["exitCode"], kill: e.Action == "kill"})
+				}
 				exits.Unlock()
 			}
 		}()
@@ -151,6 +161,62 @@ func claimExits(id string, n int, keep ...string) {
 	for i := n; i < len(exits.l); i++ {
 		if e := &exits.l[i]; e.id == id && e.unexpected() && !slices.Contains(keep, e.code) {
 			e.fault = true
+		}
+	}
+}
+
+// claimDeath marks the exit of container c that its state shows, an
+// error's (see errExit), and its other exits after the first n, as a
+// fault's doing (see claimExits), once Docker has logged it: Docker sets
+// the state before it logs the die event, so it waits up to 5 s for the
+// event of that death, the first with its code since the container last
+// started (an earlier death's, one another fault claimed and started it
+// again after, came before that start).
+func claimDeath(c container, n int) {
+	code := strconv.Itoa(c.State.ExitCode)
+	for t := time.Now(); time.Since(t) < 5*time.Second; time.Sleep(10 * time.Millisecond) {
+		exits.Lock()
+		ok := slices.ContainsFunc(exits.l[max(n, exits.started[c.ID]):], func(e exit) bool {
+			return e.id == c.ID && !e.kill && e.code == code
+		})
+		exits.Unlock()
+		if ok {
+			break
+		}
+	}
+	claimExits(c.ID, n, "132", "139")
+}
+
+// takeExit marks the first exit of container id after the first n that no
+// crash took yet and that match accepts as taken by a crash, and is whether
+// there was one. (An exit that matches no crash stays for another fault's.)
+func takeExit(id string, n int, match func(exit) bool) bool {
+	exits.Lock()
+	defer exits.Unlock()
+	for i := n; i < len(exits.l); i++ {
+		if e := &exits.l[i]; e.id == id && !e.kill && !e.taken && match(*e) {
+			e.taken = true
+			return true
+		}
+	}
+	return false
+}
+
+// markBoot marks container id's first exit after the first m, waiting up to
+// 5 s for it, as a disk fault's reboot's kill, sent once the kernel's log
+// had reached record bound: a crash logged by then may be one it cut short.
+// Only if it's a SIGKILL's, 137: Docker takes a kill of a process that has
+// exited already, and then the exit is the process's own.
+func markBoot(id string, m, bound int) {
+	for t := time.Now(); time.Since(t) < 5*time.Second; time.Sleep(10 * time.Millisecond) {
+		exits.Lock()
+		i := slices.IndexFunc(exits.l[m:], func(e exit) bool { return e.id == id && !e.kill })
+		if i >= 0 && exits.l[m+i].code == "137" {
+			exits.l[m+i].boot = bound + 1
+		}
+		exits.Unlock()
+		if i >= 0 {
+			return
 		}
 	}
 }
@@ -426,10 +492,11 @@ type container struct {
 	ID    string
 	Name  string
 	State struct {
-		Status   string
-		Pid      int
-		ExitCode int
-		Health   *struct{ Status string }
+		Status     string
+		Pid        int
+		ExitCode   int
+		FinishedAt string // (RFC 3339)
+		Health     *struct{ Status string }
 	}
 	Config struct {
 		Labels     map[string]string

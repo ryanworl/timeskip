@@ -973,3 +973,30 @@
  	if (!datasync && (inode->i_state & I_DIRTY_TIME))
  		mark_inode_dirty_sync(inode);
  	return file->f_op->fsync(file, start, end, datasync);
+--- a/kernel/signal.c
+@@ -1251,15 +1251,21 @@
+ {
+ 	struct pt_regs *regs = task_pt_regs(current);
+ 	struct file *exe_file;
++	char cgroup[NAME_MAX + 1] = "";
+ 
++	/* timeskip: the name of the task's cgroup (a container's ID), so that
++	 * the guest agent knows which container it was in. */
++	rcu_read_lock();
++	cgroup_name(task_dfl_cgroup(current), cgroup, sizeof(cgroup));
++	rcu_read_unlock();
+ 	exe_file = get_task_exe_file(current);
+ 	if (exe_file) {
+-		pr_info("%pD: %s: potentially unexpected fatal signal %d.\n",
+-			exe_file, current->comm, signr);
++		pr_info("%pD: %s: potentially unexpected fatal signal %d (cgroup %s).\n",
++			exe_file, current->comm, signr, cgroup);
+ 		fput(exe_file);
+ 	} else {
+-		pr_info("%s: potentially unexpected fatal signal %d.\n",
+-			current->comm, signr);
++		pr_info("%s: potentially unexpected fatal signal %d (cgroup %s).\n",
++			current->comm, signr, cgroup);
+ 	}
+ 
+ #if defined(__i386__) && !defined(__arch_um__)

@@ -1,0 +1,61 @@
+# expect: 1. A container whose write failed on a full disk and that dies
+# of it seconds after the fault lifted, as ClickHouse Keeper's crash
+# handler does: writer, on ENOSPC, waits until it can write again, spins 2 s
+# (its cgroup busy, so the fault watches it), then aborts (SIGABRT, under
+# Docker's init). Its exit and its crash are the fault's doing, and it's
+# started again; a start that follows such a death says so. bystander runs
+# the same program on a node excluded from disk faults and aborts as the
+# writer's spin ends: its exit and its crash still count, and only those.
+# errors: (containers: \S*bystander\S* exited with code 134; crash: sh: sh died of signal 6 \(aborted\))?
+# args: --timelines 6 --seed 1
+x-lib: &lib |
+  assert() { echo "{\"antithesis_assert\": {\"assert_type\": \"$$1\", \"display_type\": \"$$2\", \"message\": \"$$3\", \"condition\": $$4, \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl; }
+  # spin S: busy for S seconds of uptime.
+  spin() { read u _ < /proc/uptime; e=$$(($${u%.*} + $$1)); while read u _ < /proc/uptime && [ $${u%.*} -lt $$e ]; do :; done; }
+x-timeskip:
+  faults: legacy
+  disk_faults: [full]
+  fault_gap: 2
+services:
+  writer:
+    image: busybox:1.36
+    init: true
+    labels: {com.antithesis.exclude_from_faults: "network"}
+    environment: {LIB: *lib}
+    volumes: [data:/data, acks:/acks]
+    command:
+      - sh
+      - -c
+      - |
+        eval "$$LIB"
+        [ -f /acks/died ]; assert sometimes Sometimes "a start follows a death after the disk healed" $$([ $$? = 0 ] && echo true || echo false)
+        rm -f /acks/died
+        while dd if=/dev/zero of=/data/f bs=64k count=4 conv=fsync 2> /dev/null; do rm /data/f; sleep 0.1; done
+        until dd if=/dev/zero of=/data/f bs=4k count=1 conv=fsync 2> /dev/null; do sleep 0.1; done
+        spin 2
+        touch /acks/died /acks/grace
+        kill -ABRT $$$$
+  bystander:
+    image: busybox:1.36
+    init: true
+    labels: {com.antithesis.exclude_from_faults: "network,disk"}
+    environment: {LIB: *lib}
+    volumes: [acks:/acks]
+    command: [sh, -c, "until [ -f /acks/grace ]; do sleep 0.05; done; kill -ABRT $$$$"]
+  workload:
+    image: busybox:1.36
+    labels: {com.antithesis.exclude_from_faults: "network,disk,pause,stop,kill,throttle"}
+    volumes: [acks:/acks]   # (it keeps the tmpfs mounted as the others restart)
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        printf '#!/bin/sh\nsleep 40\n' > $$d/singleton_driver_wait
+        chmod +x $$d/singleton_driver_wait
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
+volumes:
+  data:
+  acks:
+    driver_opts: {type: tmpfs, device: tmpfs}

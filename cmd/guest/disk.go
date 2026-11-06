@@ -42,6 +42,7 @@ type disk struct {
 	mu     sync.Mutex  // held while it changes: remounted, filled, its faults set
 	faulty int         // disk faults in effect
 	later  []container // containers that failed to start meanwhile, to start as they heal
+	deaths []container // containers whose deaths a grace claimed meanwhile, ditto (see injector.claimedStart)
 }
 
 // disks are the node disks, by the ID of each container on them.
@@ -393,6 +394,9 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 	if len(ds) == 0 {
 		return nil, nil, nil
 	}
+	// (Its crashes come after seq, read before it begins, as a process may
+	// die at once: see the grace below.)
+	seq := in.r.crashSeq()
 	n := exitCount()
 	// (While it lasts, other faults' heals leave its containers that
 	// can't start to it: see injector.restart.)
@@ -401,15 +405,15 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 		d.faulty++
 		d.mu.Unlock()
 	}
-	release := func() (later []container) {
+	release := func() (later, deaths []container) {
 		for _, d := range ds {
 			d.mu.Lock()
 			d.faulty--
-			later = append(later, d.later...)
-			d.later = nil
+			later, deaths = append(later, d.later...), append(deaths, d.deaths...)
+			d.later, d.deaths = nil, nil
 			d.mu.Unlock()
 		}
-		return later
+		return later, deaths
 	}
 	f := &protocol.Fault{Kind: "disk", Targets: [][]string{names(cs)}}
 	var lift func() error
@@ -478,6 +482,7 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 		// failed are rebooted first, as a machine is after a disk failure.
 		// (Every container on its disks, those down when it began
 		// included, as another fault's heal may have started them since.)
+		claimed := map[string]bool{} // (whose deaths it claimed, not those its reboots took down: see restart)
 		scan := func(now map[string]container) {
 			for _, c := range slices.SortedFunc(maps.Values(now), func(a, b container) int { return strings.Compare(a.Name, b.Name) }) {
 				if d := disks[c.ID]; d == nil || !slices.Contains(ds, d) || !hit(d) {
@@ -488,8 +493,10 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 				claimExits(c.ID, n, "132", "139")
 				s := now[c.ID].State
 				if errExit(now[c.ID]) && !in.r.isDown(c.ID) && !slices.ContainsFunc(start, func(o container) bool { return o.ID == c.ID }) {
+					claimDeath(c, n)
 					say("fault: starting %s again (it exited with code %d on a %s disk)", c.Name, s.ExitCode, map[bool]string{true: "failing", false: "full"}[kind == "fail"])
 					start = append(start, c)
+					claimed[c.ID] = true
 				}
 			}
 		}
@@ -512,6 +519,7 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 		}
 		boot()
 		errs = append(errs, lift())
+		lifted := time.Now()
 		boot()
 		// (On a loaded host an exit may take longer than that: once the
 		// VM idles, it came.)
@@ -526,15 +534,31 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 			scan(now)
 		}
 		// (Only now, once it's rebooted, may other faults' heals start
-		// its containers: those that tried are started here.)
-		for _, c := range release() {
+		// its containers: those that tried are started here, and those
+		// whose deaths other faults' graces claimed.)
+		later, deaths := release()
+		for _, c := range slices.Concat(later, deaths) {
 			if !slices.ContainsFunc(start, func(o container) bool { return o.ID == c.ID }) {
 				start = append(start, c)
 			}
 		}
+		for _, c := range deaths {
+			claimed[c.ID] = !slices.ContainsFunc(later, func(o container) bool { return o.ID == c.ID })
+		}
+		// (One whose death it claimed it starts only if nothing took it
+		// over since, and leaves its down state alone, which is a node
+		// fault's; those its reboots took down, or that other faults' heals
+		// left to it, are its own.)
+		var started sync.Map // (each() starts them at once)
 		restart := func(c container) error {
+			if claimed[c.ID] {
+				ok, err := in.claimedStart(c)
+				started.Store(c.ID, ok && err == nil)
+				return err
+			}
 			err := in.restart(c)
 			in.r.downed(c, false)
+			started.Store(c.ID, err == nil)
 			return err
 		}
 		// (Level by level, as a node fault's heal: a container that shares
@@ -568,14 +592,100 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 				return errors.Join(append(errs, err)...)
 			}
 			for _, c := range start {
+				if ok, _ := started.Load(c.ID); ok != true {
+					continue
+				}
 				if errExit(now[c.ID]) && !in.r.isDown(c.ID) && !slices.ContainsFunc(again, func(o container) bool { return o.ID == c.ID }) {
-					claimExits(c.ID, n, "132", "139")
+					claimDeath(now[c.ID], n)
 					say("fault: starting %s once more (it exited with code %d as it started)", c.Name, now[c.ID].State.ExitCode)
-					again = append(again, c)
+					again = append(again, now[c.ID])
+					claimed[c.ID] = true
 				}
 			}
 		}
-		return errors.Join(append(errs, restartAll(again))...)
+		errs = append(errs, restartAll(again))
+		// A system may take a while to die of an error the fault left it
+		// (ClickHouse Keeper's crash handler reports a failed write's
+		// abort, then goes on for seconds before the process dies of
+		// SIGTRAP): for 10 s after the fault lifts, a container whose
+		// reads or writes failed that exits on an error is the fault's
+		// doing too, and started again, once (see injector.claimedStart).
+		// A container idle for a second (its cgroup used no CPU) is let
+		// go, and the grace ends once none is left. Then the crashes since
+		// the fault began in those containers are its doing too, one for
+		// each of their deaths by that signal since then. (In the
+		// background: the heal, and the next disk fault, don't wait for
+		// it; the timeline's end does, see runner.finish.)
+		in.r.graces.Add(1)
+		go func() {
+			defer in.r.graces.Done()
+			var err error
+			watch := map[string]bool{}
+			for id := range now {
+				if d := disks[id]; d != nil && slices.Contains(ds, d) && hit(d) && !slices.ContainsFunc(again, func(o container) bool { return o.ID == id }) {
+					watch[id] = true
+				}
+			}
+			used, quiet := map[string]uint64{}, map[string]int{}
+			for end := lifted.Add(10 * time.Second); len(watch) > 0 && time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+				if now, err = current(); err != nil {
+					in.errorf("disk fault's grace: %v", err)
+					break
+				}
+				cpu := cgroupCPU()
+				for _, id := range slices.Sorted(maps.Keys(watch)) {
+					c := now[id]
+					switch {
+					case errExit(c) && !in.r.isDown(id):
+						claimDeath(c, n)
+						say("fault: starting %s again (it exited with code %d %.1f s after the %s disk healed)", c.Name, c.State.ExitCode, time.Since(lifted).Seconds(), map[bool]string{true: "failing", false: "full"}[kind == "fail"])
+						if _, err := in.claimedStart(c); err != nil {
+							in.errorf("starting %s again: %v", c.Name, err)
+						}
+						delete(watch, id)
+					case !up(c):
+						delete(watch, id)
+					case cpu[id].us == used[id]:
+						if quiet[id]++; quiet[id] >= 10 {
+							delete(watch, id)
+						}
+					default:
+						quiet[id] = 0
+					}
+					used[id] = cpu[id].us
+				}
+			}
+			// (Each crash is matched to an exit, by its signal (128+N), of
+			// the container whose cgroup its process was in (the kernel logs
+			// the cgroup's name, the container's ID), one whose reads or
+			// writes failed: one crash an exit, whatever fault the exit was
+			// taken as, such as a stop's that came as the crash handler ran,
+			// and no exit matched by another disk fault's grace too. So a
+			// crash in another container, or of a process whose container
+			// ran on, stays a crash. A kill of the fault's reboot may have
+			// cut a crash short, its process dying as the reboot came, as
+			// TigerBeetle's on a latent sector error: it matches one crash
+			// in its container of any signal, logged before the kill was
+			// sent; see markBoot.)
+			code := func(c crash) func(exit) bool {
+				return func(e exit) bool { return e.code == strconv.Itoa(128+c.sig) }
+			}
+			cut := func(c crash) func(exit) bool {
+				return func(e exit) bool { return c.seq < e.boot }
+			}
+			claim := func(c crash) bool {
+				for _, match := range []func(crash) func(exit) bool{code, cut} {
+					if d := disks[c.cgroup]; d != nil && slices.Contains(ds, d) && hit(d) && takeExit(c.cgroup, n, match(c)) {
+						return true
+					}
+				}
+				return false
+			}
+			for _, c := range in.r.claimCrashes(seq, claim) {
+				say("fault: %s, on a %s disk", c, map[bool]string{true: "failing", false: "full"}[kind == "fail"])
+			}
+		}()
+		return errors.Join(errs...)
 	}
 	return f, heal, nil
 }
@@ -634,11 +744,27 @@ func (in *injector) reboot(d *disk, start *[]container) error {
 			*start = append(*start, c)
 		}
 	}
-	_, err = each(cs, killWait)
+	_, err = each(cs, in.rebootKill)
 	if err == nil {
 		if err = d.sys0("fail", "0"); err == nil { // (its fault is over)
 			err = d.remount(false)
 		}
+	}
+	return err
+}
+
+// rebootKill kills container c for a reboot (see killWait) and marks its
+// exit as the reboot's, with the kernel log's position just before the
+// kill: a crash logged by then may be one it cut short (see markBoot).
+func (in *injector) rebootKill(c container) error {
+	bound, m := in.r.crashSeq(), exitCount()
+	err := call("POST", "/containers/"+c.ID+"/kill", nil, nil)
+	sent := err == nil
+	if err == nil || exited(err) { // (it exited meanwhile)
+		err = call("POST", "/containers/"+c.ID+"/wait?condition=not-running", nil, nil)
+	}
+	if sent && err == nil {
+		markBoot(c.ID, m, bound)
 	}
 	return err
 }

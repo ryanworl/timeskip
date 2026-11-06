@@ -228,6 +228,10 @@ type runner struct {
 	paused     map[string]bool // containers a node fault paused (see enter)
 	starting   map[string]int  // ... and processes starting in them
 	kmsg       int             // the kernel's log from GO on (see crashes)
+	crashed    []crash         // what crashes read of it so far
+	kmsgSeq    int             // the sequence number of its last record read, or -1
+	graces     sync.WaitGroup  // disk faults' graces under way (see injector.disk)
+	own        sync.Mutex      // held as a node fault takes a container down, and as a grace starts one (see injector.claimedStart)
 	faults     []protocol.Fault
 	faultMix   string // the half of the mixture drawn, if any (see inject)
 	faultGapMs int64  // the most guest time between faults drawn, if any
@@ -275,7 +279,7 @@ func (r *runner) over() bool {
 }
 
 func newRunner(tmpl string) *runner {
-	r := &runner{tmpl: tmpl, running: map[*proc]string{}, exits: exitCount(), kmsg: -1, down: map[string]bool{}, downs: map[string]int{}, paused: map[string]bool{}, starting: map[string]int{}}
+	r := &runner{tmpl: tmpl, running: map[*proc]string{}, exits: exitCount(), kmsg: -1, kmsgSeq: -1, down: map[string]bool{}, downs: map[string]int{}, paused: map[string]bool{}, starting: map[string]int{}}
 	if fd, err := syscall.Open("/dev/kmsg", syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0); err == nil {
 		syscall.Seek(fd, 0, io.SeekEnd)
 		r.kmsg = fd
@@ -340,6 +344,10 @@ func (r *runner) start(c command) *proc {
 // again. A command it kills, or that would start while it's down, counts
 // as killed by the fault, as in Antithesis.
 func (r *runner) downed(c container, down bool) {
+	if down {
+		r.own.Lock()
+		defer r.own.Unlock()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if down && !r.down[c.ID] {
@@ -625,6 +633,7 @@ func (r *runner) drive(cat catalog, g protocol.Go) {
 func (r *runner) finish() {
 	r.stopWatchdog()
 	r.wait("", nil)
+	r.graces.Wait() // (its exits and crashes are claimed by then)
 	ms := (uptime() - r.t0).Milliseconds()
 	r.mu.Lock()
 	for _, e := range exitsSince(r.exits) {
@@ -633,8 +642,11 @@ func (r *runner) finish() {
 			r.failMs = r.exitMs
 		}
 	}
-	for _, c := range crashes(r.kmsg) {
-		r.errors = append(r.errors, "crash: "+c)
+	r.readCrashes()
+	for _, c := range r.crashed {
+		if !c.claimed {
+			r.errors = append(r.errors, "crash: "+c.text)
+		}
 	}
 	commands, errs, faults, faultMix, faultGapMs, timedOut := r.records, r.errors, r.faults, r.faultMix, r.faultGapMs, r.timedOut
 	r.mu.Unlock()
@@ -730,13 +742,28 @@ func parseAssert(line []byte) (*sdkAssert, string) {
 	return m.A, cmp.Or(m.A.ID, m.A.Message)
 }
 
+// crash is a process's death of a program error signal, or one the
+// kernel killed when the VM ran out of memory, as the kernel logged it:
+// its record's sequence number, the signal and the cgroup of the process
+// (if a fatal signal's: the guest's kernel adds the cgroup), and what it
+// says; claimed if a fault caused it (see
+// claimCrashes).
+type crash struct {
+	seq     int
+	sig     int
+	cgroup  string // the name of its process's cgroup: its container's ID, if it was in one
+	text    string
+	claimed bool
+}
+
 // crashes are the processes that died of a program error signal (SIGSEGV,
 // SIGBUS, SIGABRT and the like), as Antithesis's "No unexpected crashes"
 // counts them, and those the kernel killed when the VM ran out of memory:
-// what the kernel logged (print-fatal-signals, which setup turns on) since
-// kmsg, a descriptor of /dev/kmsg, was opened.
-func crashes(kmsg int) []string {
-	var l []string
+// what the kernel logged (print-fatal-signals, which setup turns on) on
+// kmsg, a descriptor of /dev/kmsg, since the last read; and the sequence
+// number of the last record read, or -1.
+func crashes(kmsg int) (l []crash, last int) {
+	last = -1
 	buf := make([]byte, 8192)
 	for kmsg >= 0 {
 		n, err := syscall.Read(kmsg, buf)
@@ -745,16 +772,56 @@ func crashes(kmsg int) []string {
 		} else if err != nil || n <= 0 {
 			break
 		}
-		// "LEVEL,SEQ,TIME,FLAGS;[EXE: ]COMM: potentially unexpected fatal signal N."
-		_, m, _ := strings.Cut(strings.SplitN(string(buf[:n]), "\n", 2)[0], ";")
+		// "LEVEL,SEQ,TIME,FLAGS;[EXE: ]COMM: potentially unexpected fatal signal N (cgroup NAME)."
+		head, m, _ := strings.Cut(strings.SplitN(string(buf[:n]), "\n", 2)[0], ";")
+		seq := -1
+		if f := strings.Split(head, ","); len(f) > 1 {
+			seq, _ = strconv.Atoi(f[1])
+		}
+		last = seq
 		if who, sig, ok := strings.Cut(m, "potentially unexpected fatal signal "); ok {
-			n, _ := strconv.Atoi(strings.TrimSuffix(sig, "."))
-			l = append(l, fmt.Sprintf("%s died of signal %d (%v)", strings.TrimSuffix(who, ": "), n, syscall.Signal(n)))
+			sig, cg, _ := strings.Cut(strings.TrimSuffix(sig, "."), " (cgroup ")
+			n, _ := strconv.Atoi(sig)
+			who = strings.TrimSuffix(who, ": ")
+			l = append(l, crash{seq: seq, sig: n, cgroup: strings.TrimSuffix(cg, ")"), text: fmt.Sprintf("%s died of signal %d (%v)", who, n, syscall.Signal(n))})
 		} else if p, ok := strings.CutPrefix(m, "Out of memory: Killed process "); ok {
 			// (The VM ran out of memory, past Antithesis's "Peak memory
 			// usage" bound of 95%; not a container's own memory limit.)
 			p, _, _ = strings.Cut(p, " total-vm")
-			l = append(l, "the VM ran out of memory and killed process "+p)
+			l = append(l, crash{seq: seq, text: "the VM ran out of memory and killed process " + p})
+		}
+	}
+	return l, last
+}
+
+// readCrashes reads the kernel's log on into r.crashed. (With r.mu held.)
+func (r *runner) readCrashes() {
+	l, last := crashes(r.kmsg)
+	r.crashed = append(r.crashed, l...)
+	r.kmsgSeq = max(r.kmsgSeq, last)
+}
+
+// crashSeq is the sequence number of the kernel's last record so far: a
+// fault's crashes come after it (see claimCrashes).
+func (r *runner) crashSeq() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readCrashes()
+	return r.kmsgSeq
+}
+
+// claimCrashes marks the crashes since record from that claim takes, in
+// order, as a fault's doing, but deaths of SIGILL or SIGSEGV (as a fault's
+// exits: see errExit) and those of no cgroup, and returns what they say.
+func (r *runner) claimCrashes(from int, claim func(crash) bool) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readCrashes()
+	var l []string
+	for i := range r.crashed {
+		if c := &r.crashed[i]; c.seq > from && !c.claimed && c.cgroup != "" && c.sig != int(syscall.SIGILL) && c.sig != int(syscall.SIGSEGV) && claim(*c) {
+			c.claimed = true
+			l = append(l, c.text)
 		}
 	}
 	return l

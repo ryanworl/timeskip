@@ -819,6 +819,24 @@ func TestProtocol(t *testing.T) {
 					t.Errorf("no timeline had a stop meet tini after the crash")
 				}
 			}
+			// diskgraceexit.yaml: some timeline's bystander's child aborted,
+			// and each such timeline failed with its crash.
+			if name == "diskgraceexit" {
+				aborted := 0
+				for _, tl := range r.Timelines {
+					for _, a := range tl.Assertions {
+						if a.Message == "the bystander's child aborted" && a.True > 0 {
+							aborted++
+							if len(tl.Errors) == 0 {
+								t.Errorf("timeline %d: the bystander's child aborted, but no errors", tl.Seed)
+							}
+						}
+					}
+				}
+				if aborted == 0 {
+					t.Errorf("no timeline's bystander's child aborted")
+				}
+			}
 			// faultstop.yaml: a stop starts with its SIGTERM, which the
 			// server ignores, so it lasts the 10 s until Docker's SIGKILL
 			// and more, even when ANTITHESIS_STOP_FAULTS heals it at once
