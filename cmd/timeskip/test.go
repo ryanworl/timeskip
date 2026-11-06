@@ -31,6 +31,7 @@ type options struct {
 	faultGap                 float64  // guest seconds: the longest gap between faults
 	diskFaults               []string // the kinds of disk fault
 	sets                     []string // --set's, for replays
+	replay                   bool     // a replay: one planned timeline of a given seed (--seed) or from --branch
 	out                      string   // where to write results.json, coverage/ and profiles/, if anywhere
 	profile                  bool
 	explore                  bool   // branch timelines from moments that did something new (see explore.go)
@@ -134,6 +135,7 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 			plans = append(plans, p)
 		}
 	}
+	o.replay = o.replay && len(plans) == 1 // (a search of given seeds that stops early is still judged: see properties)
 	// The timelines, up to -j at a time.
 	results := make([]run, len(plans))
 	var mu sync.Mutex

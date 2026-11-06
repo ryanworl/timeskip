@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/ryanworl/timeskip/internal/protocol"
@@ -52,7 +53,7 @@ func TestProperties(t *testing.T) {
 		"raw msg":                     "false 2 0 []",
 		"All commands were run to completion at least once": "false 2 1 [3]",
 	}
-	props := properties(runs)
+	props := properties(runs, false)
 	if len(props) != len(want) {
 		t.Errorf("%d properties, want %d", len(props), len(want))
 	}
@@ -69,5 +70,28 @@ func TestProperties(t *testing.T) {
 	}
 	if broken := broken(runs[0]); len(broken) != 0 {
 		t.Errorf("seed 1 broke %v by itself, want nothing", broken)
+	}
+	// A replay's one timeline doesn't judge what only all timelines can
+	// fail, but still what it broke itself; a random one judges all.
+	unjudged := map[string]bool{}
+	for _, p := range properties(runs[:1], true) {
+		if p.Unjudged {
+			unjudged[p.Name] = true
+		}
+	}
+	if want := map[string]bool{"sometimes msg": true, "never true msg": true, "reachable msg": true, "must hit msg": true, "raw msg": true}; fmt.Sprint(unjudged) != fmt.Sprint(want) {
+		t.Errorf("seed 1 alone: unjudged %v, want %v", unjudged, want)
+	}
+	if one := properties(runs[1:2], true); slices.ContainsFunc(one, func(p *property) bool { return p.Unjudged }) {
+		t.Errorf("seed 2 alone: unjudged properties, want none: it broke them itself")
+	}
+	if slices.ContainsFunc(properties(runs[:1], false), func(p *property) bool { return p.Unjudged }) {
+		t.Errorf("seed 1 alone, not a replay: unjudged properties, want none")
+	}
+	// (A lone timeline that ran out of time still fails completion.)
+	for _, p := range properties(runs[2:3], true) {
+		if p.Name == "All commands were run to completion at least once" && (p.Pass || p.Unjudged) {
+			t.Errorf("seed 3 alone: completion pass %v unjudged %v, want a failure", p.Pass, p.Unjudged)
+		}
 	}
 }

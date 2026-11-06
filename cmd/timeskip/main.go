@@ -252,6 +252,7 @@ func main() {
 			exit(2)
 		}
 		wantSymbols.Store(o.out != "")
+		o.replay = o.seed != 0 || o.branch != ""
 		if o.seed == 0 {
 			o.seed = uint64(rand.Int64N(1e6)) + 1
 		}

@@ -24,9 +24,14 @@ type property struct {
 	Hits    int      `json:"hits"`
 	True    int      `json:"true"`
 	Failing []uint64 `json:"failing_seeds,omitempty"` // the timelines that broke it
-	Details any      `json:"details,omitempty"`
-	key     string
-	first   *run // the first run that broke it
+	// Unjudged: a property only all timelines can fail (a Sometimes
+	// assertion never true, a must_hit one never reached) that a replay's
+	// one timeline (of a given seed, or from --branch) didn't pass, which
+	// doesn't fail it: a replay needn't reach what other timelines did.
+	Unjudged bool `json:"unjudged,omitempty"`
+	Details  any  `json:"details,omitempty"`
+	key      string
+	first    *run // the first run that broke it
 }
 
 // broken are the properties (by key) that a run broke by itself: an Always
@@ -47,7 +52,7 @@ func broken(r run) map[string]bool {
 	return m
 }
 
-func properties(runs []run) []*property {
+func properties(runs []run, replay bool) []*property {
 	var l []*property
 	by := map[string]*property{}
 	kind := map[*property]protocol.Assertion{} // (its assert_type and must_hit)
@@ -126,13 +131,22 @@ func properties(runs []run) []*property {
 			p.Pass = p.first == nil && (!k.MustHit || p.Hits > 0)
 		}
 	}
+	ran := 0
+	for _, r := range runs {
+		if !r.NotRun {
+			ran++
+		}
+	}
+	for _, p := range l {
+		p.Unjudged = replay && ran == 1 && !p.Pass && p.first == nil && len(p.Failing) == 0
+	}
 	return l
 }
 
 // report prints the timelines and the properties, writes results.json, and says
 // whether everything passed. A failed property gets a seed to replay.
 func report(runs []run, o options) bool {
-	props := properties(runs)
+	props := properties(runs, o.replay)
 	ok := true
 	passed, notRun := 0, 0
 	for _, r := range runs {
@@ -173,14 +187,17 @@ func report(runs []run, o options) bool {
 	for i := range runs {
 		runs[i].Coverage, runs[i].Symbols = nil, nil
 	}
-	failed := 0
+	failed, unjudged := 0, 0
 	for _, p := range props {
-		status := "ok  "
-		if !p.Pass {
+		status, why := "ok  ", ""
+		if p.Unjudged {
+			status, why = "--  ", "; not judged by a replay"
+			unjudged++
+		} else if !p.Pass {
 			status, ok = "FAIL", false
 			failed++
 		}
-		fmt.Fprintf(os.Stderr, "%s %-20s %s (%d of %d true)\n", status, p.Type, p.Name, p.True, p.Hits)
+		fmt.Fprintf(os.Stderr, "%s %-20s %s (%d of %d true%s)\n", status, p.Type, p.Name, p.True, p.Hits, why)
 		if b := p.first; b != nil && b.Branch != nil {
 			fmt.Fprintf(os.Stderr, "     broken in %d timelines; replay: --branch %s --seed %d\n", len(p.Failing), b.Branch.Checkpoint, b.Seed)
 		} else if b != nil {
@@ -203,7 +220,8 @@ func report(runs []run, o options) bool {
 	if notRun > 0 {
 		stopped = fmt.Sprintf(", %d not run", notRun)
 	}
-	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed%s, %d of %d properties failed\n", passed, len(runs), stopped, failed, len(props))
+	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed%s, %d of %d properties failed%s\n", passed, len(runs), stopped, failed, len(props),
+		map[bool]string{true: fmt.Sprintf(" (%d not judged by a replay)", unjudged)}[unjudged > 0])
 	return ok
 }
 
