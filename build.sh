@@ -34,7 +34,13 @@ lint/*) target=lint;;
 *) echo "usage: ./build.sh [lint|clean]" >&2; exit 2;;
 esac
 mkdir -p out
-docker build -q -t timeskip-builder - < cmd/build/builder.Dockerfile > /dev/null
+# The builder image is built again only when its Dockerfile changes (its
+# label), not whenever Docker's build cache lacks it: its apt-get needs
+# snapshot.debian.org, which can be down.
+key=$(cksum < cmd/build/builder.Dockerfile)
+if [ "$(docker image inspect -f '{{index .Config.Labels "dockerfile"}}' timeskip-builder 2>/dev/null)" != "$key" ]; then
+	docker build -q --label "dockerfile=$key" -t timeskip-builder - < cmd/build/builder.Dockerfile > /dev/null
+fi
 exec docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" -v "$cache:/cache" -w /src \
 	-v /var/run/docker.sock:/var/run/docker.sock -e OWNER="$(id -u):$(id -g)" \
 	timeskip-builder go run ./cmd/build "$target"
