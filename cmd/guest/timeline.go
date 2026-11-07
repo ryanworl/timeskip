@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/ryanworl/timeskip/internal/protocol"
 )
@@ -230,6 +231,7 @@ type runner struct {
 	kmsg       int             // the kernel's log from GO on (see crashes)
 	crashed    []crash         // what crashes read of it so far
 	kmsgSeq    int             // the sequence number of its last record read, or -1
+	kmsgLost   int             // how many times records were overwritten before they were read
 	graces     sync.WaitGroup  // disk faults' graces under way (see injector.disk)
 	own        sync.Mutex      // held as a node fault takes a container down, and as a grace starts one (see injector.claimedStart)
 	faults     []protocol.Fault
@@ -283,6 +285,25 @@ func newRunner(tmpl string) *runner {
 	if fd, err := syscall.Open("/dev/kmsg", syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0); err == nil {
 		syscall.Seek(fd, 0, io.SeekEnd)
 		r.kmsg = fd
+		// The kernel's log is a ring (256 KiB on arm64, 128 KiB on
+		// x86_64), and each crash's record takes a KiB or more with its
+		// registers: it's read as the kernel adds to it, not only when a
+		// fault or the end needs it, so that crashes aren't overwritten
+		// first.
+		go func() {
+			p := struct {
+				fd             int32
+				events, revent int16
+			}{fd: int32(fd), events: 1} // (POLLIN)
+			for {
+				if _, _, e := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, 0, 0, 0, 0); e != 0 && e != syscall.EINTR {
+					return
+				}
+				r.mu.Lock()
+				r.readCrashes()
+				r.mu.Unlock()
+			}
+		}()
 	}
 	r.ctx, r.expire = context.WithCancelCause(context.Background())
 	return r
@@ -648,6 +669,9 @@ func (r *runner) finish() {
 			r.errors = append(r.errors, "crash: "+c.text)
 		}
 	}
+	if r.kmsgLost > 0 {
+		r.errors = append(r.errors, fmt.Sprintf("crash: the kernel's log overwrote records before they were read (%d times): crashes among them aren't reported", r.kmsgLost))
+	}
 	commands, errs, faults, faultMix, faultGapMs, timedOut := r.records, r.errors, r.faults, r.faultMix, r.faultGapMs, r.timedOut
 	r.mu.Unlock()
 	if len(errs) > 0 {
@@ -761,13 +785,15 @@ type crash struct {
 // counts them, and those the kernel killed when the VM ran out of memory:
 // what the kernel logged (print-fatal-signals, which setup turns on) on
 // kmsg, a descriptor of /dev/kmsg, since the last read; and the sequence
-// number of the last record read, or -1.
-func crashes(kmsg int) (l []crash, last int) {
+// number of the last record read, or -1; and how many times records were
+// overwritten before they were read.
+func crashes(kmsg int) (l []crash, last, lost int) {
 	last = -1
 	buf := make([]byte, 8192)
 	for kmsg >= 0 {
 		n, err := syscall.Read(kmsg, buf)
 		if err == syscall.EPIPE { // (records were overwritten)
+			lost++
 			continue
 		} else if err != nil || n <= 0 {
 			break
@@ -791,13 +817,14 @@ func crashes(kmsg int) (l []crash, last int) {
 			l = append(l, crash{seq: seq, text: "the VM ran out of memory and killed process " + p})
 		}
 	}
-	return l, last
+	return l, last, lost
 }
 
 // readCrashes reads the kernel's log on into r.crashed. (With r.mu held.)
 func (r *runner) readCrashes() {
-	l, last := crashes(r.kmsg)
+	l, last, lost := crashes(r.kmsg)
 	r.crashed = append(r.crashed, l...)
+	r.kmsgLost += lost
 	r.kmsgSeq = max(r.kmsgSeq, last)
 }
 
