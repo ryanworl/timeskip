@@ -788,6 +788,10 @@ func TestProtocol(t *testing.T) {
 					t.Errorf("failed properties %q, want %q", got, m[1])
 				}
 			}
+			// execoutput.yaml: the command's last lines, after its 1 MB line.
+			if name == "execoutput" && !strings.Contains(out, "[t/singleton_driver_x] END 3") {
+				t.Errorf("no END 3 from the command in its output (%d bytes)", len(out))
+			}
 			// faultcrashrace.yaml: the timelines whose racer reached "racer
 			// exits 1", and only those, failed with its crash.
 			if name == "faultcrashrace" {

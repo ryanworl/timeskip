@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // The Docker Engine API, over dockerd's socket: cheaper than a docker CLI
@@ -672,25 +673,93 @@ func execIn(id, path string, out io.Writer, started func(pid int)) (int, time.Du
 			cmd.SysProcAttr.UseCgroupFD, cmd.SysProcAttr.CgroupFD = true, int(cg.Fd())
 		}
 	}
-	cmd.Stdout, cmd.Stderr = out, out
-	// (Output after it exited, from what it left running, isn't waited for.)
-	cmd.WaitDelay = time.Second
-	if err := cmd.Start(); err != nil {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer r.Close()
+	cmd.Stdout, cmd.Stderr = w, w
+	err = cmd.Start()
+	w.Close()
+	if err != nil {
 		return 0, 0, err
 	}
 	if started != nil {
 		started(cmd.Process.Pid)
 	}
+	exited, copied := make(chan int, 1), make(chan struct{})
+	go func() {
+		copyOutput(r, out, exited)
+		close(copied)
+	}()
 	err = cmd.Wait()
+	exited <- queued(r)
+	r.SetReadDeadline(time.Now()) // (see copyOutput)
+	<-copied
 	cpu := cmd.ProcessState.UserTime() + cmd.ProcessState.SystemTime()
 	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 		return 128 + int(ws.Signal()), cpu, nil // (as runc reports it)
 	}
 	var x *exec.ExitError
-	if err != nil && !errors.As(err, &x) && !errors.Is(err, exec.ErrWaitDelay) {
+	if err != nil && !errors.As(err, &x) {
 		return 0, cpu, err
 	}
 	return cmd.ProcessState.ExitCode(), cpu, nil
+}
+
+// copyOutput copies a command's output from r to out until r ends, or once
+// the command exited (r's read deadline, set to then, says so, and exited
+// how much it left in the pipe), until that's taken too, and then 1 s more:
+// output after it exited, from what it left running, isn't waited for, but
+// what it wrote before is copied whole, however slowly out takes it.
+func copyOutput(r *os.File, out io.Writer, exited <-chan int) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := r.Read(buf)
+		out.Write(buf[:n])
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			break
+		} else if err != nil {
+			return
+		}
+	}
+	// (Some of it may be read already: then reads stop as the pipe empties.)
+	r.SetReadDeadline(time.Time{})
+	rc, err := r.SyscallConn()
+	if err != nil {
+		return
+	}
+	for left := <-exited; left > 0; {
+		n := 0
+		rc.Read(func(fd uintptr) bool {
+			n, _ = syscall.Read(int(fd), buf[:min(left, len(buf))])
+			return true // (r is non-blocking)
+		})
+		if n <= 0 {
+			break
+		}
+		out.Write(buf[:n])
+		left -= n
+	}
+	r.SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		n, err := r.Read(buf)
+		out.Write(buf[:n])
+		if err != nil {
+			return
+		}
+	}
+}
+
+// queued is how many bytes are in pipe r.
+func queued(r *os.File) int {
+	var n int32
+	if rc, err := r.SyscallConn(); err == nil {
+		rc.Control(func(fd uintptr) {
+			syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCINQ, uintptr(unsafe.Pointer(&n)))
+		})
+	}
+	return int(n)
 }
 
 // An execTarget is what execIn needs of a running container: its main
