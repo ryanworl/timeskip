@@ -985,6 +985,59 @@
  	timer_setup(&lo->timer, loop_free_idle_workers_timer, TIMER_DEFERRABLE);
  	lo->lo_state = Lo_unbound;
  
+--- a/drivers/tty/serial/8250/8250.h
++++ b/drivers/tty/serial/8250/8250.h
+@@ -11,6 +11,7 @@
+ #include <linux/serial_8250.h>
+ #include <linux/serial_core.h>
+ #include <linux/dmaengine.h>
++#include <linux/tick.h>
+ 
+ #include "../serial_mctrl_gpio.h"
+ 
+@@ -204,6 +205,14 @@
+ 	if (up->ier & UART_IER_THRI)
+ 		return false;
+ 	up->ier |= UART_IER_THRI;
++	/*
++	 * Until THRI is cleared, the port awaits the host's transmit
++	 * interrupt, which an emulated UART's host may inject late (KVM, an
++	 * irqfd on an IOAPIC pin, from a workqueue): in flight for timeskip,
++	 * as a block request is, so that a writer waiting on a full buffer
++	 * doesn't skip the guest's clock to its next timer.
++	 */
++	timeskip_io_start();
+ 	serial_out(up, UART_IER, up->ier);
+ 	return true;
+ }
+@@ -216,6 +225,7 @@
+ 	if (!(up->ier & UART_IER_THRI))
+ 		return false;
+ 	up->ier &= ~UART_IER_THRI;
++	timeskip_io_end();
+ 	serial_out(up, UART_IER, up->ier);
+ 	return true;
+ }
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -2433,6 +2433,8 @@
+ 	 * enable until after the FIFOs are enabled; otherwise, an already-
+ 	 * active sender can swamp the interrupt handler with "too much work".
+ 	 */
++	if (up->ier & UART_IER_THRI)
++		timeskip_io_end();
+ 	up->ier = UART_IER_RLSI | UART_IER_RDI;
+ 
+ 	if (port->flags & UPF_FOURPORT) {
+@@ -2470,6 +2472,8 @@
+ 	 * Synchronize UART_IER access against the console.
+ 	 */
+ 	uart_port_lock_irqsave(port, &flags);
++	if (up->ier & UART_IER_THRI)
++		timeskip_io_end();
+ 	up->ier = 0;
+ 	serial_port_out(port, UART_IER, 0);
+ 	uart_port_unlock_irqrestore(port, flags);
 --- a/include/linux/fs.h
 +++ b/include/linux/fs.h
 @@ -3739,4 +3739,7 @@
