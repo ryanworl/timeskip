@@ -1,14 +1,18 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -79,13 +83,44 @@ func (c *checkpoint) publish() {
 // on macOS for the OS build (whose Hypervisor.framework may save the GIC
 // differently), and on Linux for where the kit is (Firecracker's saved VM
 // names its root filesystem's file).
-func kitID() string {
+var kitID = sync.OnceValue(func() string {
 	m, err := os.ReadFile(filepath.Join(home, "MANIFEST"))
 	if err != nil {
 		die("the kit has no MANIFEST: %v", err)
 	}
+	if err := checkKit(home, string(m)); err != nil {
+		die("%v", err)
+	}
 	_, rootfs := guest()
 	return hash(osBuild(), string(m), map[bool]string{false: rootfs}[darwin])
+})
+
+// checkKit: the kit's programs and guest (the CLI, bin/ and share/) are the
+// files its MANIFEST lists. The cache's checkpoints are the
+// MANIFEST's, so a file changed in place (a debugging hvrun copied into a
+// kit, say) would use and save that kit's as its own.
+func checkKit(dir, manifest string) error {
+	_, files, _ := strings.Cut(manifest, "\n\n")
+	for _, l := range strings.Split(files, "\n") {
+		sum, name, ok := strings.Cut(l, "  ./")
+		if !ok || name != "timeskip" && !strings.HasPrefix(name, "bin/") && !strings.HasPrefix(name, "share/") {
+			continue
+		}
+		f, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			return fmt.Errorf("the kit's %s: %v", name, err)
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("the kit's %s: %v", name, err)
+		}
+		if got := hex.EncodeToString(h.Sum(nil)); got != sum {
+			return fmt.Errorf("the kit's %s isn't the file its MANIFEST lists (SHA-256 %s, not %s): the cache keeps checkpoints by the MANIFEST, so a changed file would use another kit's. To run it, put its SHA-256 on its line in %s, which makes it a kit of its own", name, got, sum, filepath.Join(dir, "MANIFEST"))
+		}
+	}
+	return nil
 }
 
 // setupCheckpoint returns bundle b's setup checkpoint (b is, or will be, at

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -104,5 +105,40 @@ func TestTrim(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(cache, p)); (err == nil) != keep {
 			t.Errorf("%s: kept %v, want %v", p, err == nil, keep)
 		}
+	}
+}
+
+// TestCheckKit checks that a kit whose bin/hvrun was swapped for another
+// is refused, until its MANIFEST lists the new file.
+func TestCheckKit(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{"timeskip": "cli", "bin/hvrun": "hvrun", "share/Image-arm64": "kernel", "LICENSE": "license"}
+	manifest := func() string {
+		m := "timeskip v1 macos-arm64\nsource: x\n\n"
+		for _, f := range []string{"LICENSE", "bin/hvrun", "share/Image-arm64", "timeskip"} {
+			m += fmt.Sprintf("%x  ./%s\n", sha256.Sum256([]byte(files[f])), f)
+		}
+		return m
+	}
+	write := func(f string) {
+		os.MkdirAll(filepath.Dir(filepath.Join(dir, f)), 0o755)
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(files[f]), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for f := range files {
+		write(f)
+	}
+	m := manifest()
+	if err := checkKit(dir, m); err != nil {
+		t.Fatalf("the kit as built: %v", err)
+	}
+	files["bin/hvrun"] = "a debugging hvrun"
+	write("bin/hvrun")
+	if err := checkKit(dir, m); err == nil || !strings.Contains(err.Error(), "bin/hvrun") {
+		t.Fatalf("a swapped bin/hvrun: %v, want it refused", err)
+	}
+	if err := checkKit(dir, manifest()); err != nil {
+		t.Fatalf("a swapped bin/hvrun that the MANIFEST lists: %v", err)
 	}
 }
