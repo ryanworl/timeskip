@@ -1001,3 +1001,22 @@
  	}
  
  #if defined(__i386__) && !defined(__arch_um__)
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -2101,7 +2101,15 @@
+ 
+ 	restart = &current->restart_block;
+ 	if (restart->nanosleep.type != TT_NONE) {
+-		ktime_t rem = hrtimer_expires_remaining(&t->timer);
++		/*
++		 * timeskip: what's left of the requested sleep, without the
++		 * timer's slack (the guest's processes have 1 ms of it): from
++		 * the hard expiry, each sleep restarted with the remainder
++		 * after a signal would end up to the slack later, and under a
++		 * signal every millisecond it would never end.
++		 */
++		ktime_t rem = ktime_sub(hrtimer_get_softexpires(&t->timer),
++					t->timer.base->get_time());
+ 		struct timespec64 rmt;
+ 
+ 		if (rem <= 0)
