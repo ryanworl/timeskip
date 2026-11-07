@@ -295,23 +295,43 @@
  	} else {
 --- a/fs/ext4/page-io.c
 +++ b/fs/ext4/page-io.c
-@@ -136,6 +136,15 @@
- 			if (bio->bi_status) {
+@@ -97,7 +97,7 @@
+ 			(unsigned long long)bh->b_blocknr);
+ }
+ 
+-static void ext4_finish_bio(struct bio *bio)
++static void ext4_finish_bio(struct bio *bio, bool unconverted)
+ {
+ 	struct folio_iter fi;
+ 
+@@ -137,6 +137,17 @@
  				set_buffer_write_io_error(bh);
  				buffer_io_error(bh);
-+				/*
-+				 * time-skip: mapped again at its next write. Its
-+				 * block may still be unwritten (the conversion is
-+				 * skipped on an error), and a later write to a
-+				 * buffer mapped as written isn't converted: once
-+				 * evicted, its data would read as zeros, though
-+				 * fsync reported none.
-+				 */
-+				clear_buffer_mapped(bh);
  			}
++			/*
++			 * time-skip: its io_end's conversion was skipped (one
++			 * of its writes failed, or the conversion did), so its
++			 * block may still be unwritten: its next writeback maps
++			 * and converts it, or its data would read as zeros once
++			 * evicted, though fsync reported none. It stays mapped:
++			 * writeback drops a dirty buffer that isn't, and a write
++			 * racing this completion finds it mapped.
++			 */
++			if (unconverted)
++				set_buffer_unwritten(bh);
  		} while ((bh = bh->b_this_page) != head);
  		spin_unlock_irqrestore(&head->b_uptodate_lock, flags);
-@@ -199,6 +208,14 @@
+ 		if (!under_io) {
+@@ -156,7 +167,7 @@
+ 
+ 	for (bio = io_end->bio; bio; bio = next_bio) {
+ 		next_bio = bio->bi_private;
+-		ext4_finish_bio(bio);
++		ext4_finish_bio(bio, io_end->flag & EXT4_IO_END_FAILED);
+ 		bio_put(bio);
+ 	}
+ 	ext4_free_io_end_vec(io_end);
+@@ -199,6 +210,16 @@
  			 "extents -- potential data loss!  "
  			 "(inode %lu, error %d)", inode->i_ino, ret);
  	}
@@ -321,11 +341,53 @@
 +	 * leaves the data unreadable, yet fsync, finding no transaction to
 +	 * wait for, would succeed.)
 +	 */
-+	if (ret < 0)
++	if (ret < 0) {
 +		mapping_set_error(inode->i_mapping, ret);
++		io_end->flag |= EXT4_IO_END_FAILED; /* (not converted: see ext4_finish_bio) */
++	}
  
  	ext4_clear_io_unwritten_flag(io_end);
  	ext4_release_io_end(io_end);
+@@ -313,12 +334,15 @@
+ 	int err = 0;
+ 
+ 	if (refcount_dec_and_test(&io_end->count)) {
+-		if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
+-			err = ext4_convert_unwritten_io_end_vec(io_end->handle,
+-								io_end);
+-			io_end->handle = NULL;
+-			ext4_clear_io_unwritten_flag(io_end);
+-		}
++		/*
++		 * time-skip: as ext4_end_io_end (as later Linux does here):
++		 * not converted if a write failed, or a block that was
++		 * never written would read as what was there before.
++		 */
++		if (io_end->flag & EXT4_IO_END_UNWRITTEN &&
++		    !list_empty(&io_end->list_vec))
++			return ext4_end_io_end(io_end);
++		ext4_clear_io_unwritten_flag(io_end);
+ 		ext4_release_io_end(io_end);
+ 	}
+ 	return err;
+@@ -341,7 +365,7 @@
+ 		      (long long) bio->bi_iter.bi_sector,
+ 		      (unsigned) bio_sectors(bio),
+ 		      bio->bi_status)) {
+-		ext4_finish_bio(bio);
++		ext4_finish_bio(bio, false);
+ 		bio_put(bio);
+ 		return;
+ 	}
+@@ -374,7 +398,7 @@
+ 		 * we finish the bio.
+ 		 */
+ 		ext4_put_io_end_defer(io_end);
+-		ext4_finish_bio(bio);
++		ext4_finish_bio(bio, false);
+ 		bio_put(bio);
+ 	}
+ }
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
 @@ -467,6 +467,7 @@
