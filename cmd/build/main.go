@@ -226,8 +226,14 @@ func unpack(log io.Writer, w, tree, tarball string, patches []string) error {
 	if b, _ := os.ReadFile(w + "/source"); string(b) == key {
 		return nil
 	}
-	os.Remove(w + "/source") // (written again once the tree is whole)
-	os.RemoveAll(tree)
+	// (The marker is written again once the tree is whole; a tree that
+	// can't be removed would be overlaid, not new.)
+	if err := os.Remove(w + "/source"); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.RemoveAll(tree); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(tree, 0o755); err != nil {
 		return err
 	}
@@ -244,7 +250,11 @@ func unpack(log io.Writer, w, tree, tarball string, patches []string) error {
 
 // Firecracker 1.17.0 with the patches in firecracker/, a static musl binary
 // built with the Rust toolchain its rust-toolchain.toml names.
-// The tree and cargo's cache stay in the cache volume.
+// The tree and cargo's cache stay in the cache volume. Its build outputs
+// are in the tree, so that a new tree (other patches) builds from nothing:
+// cargo judges sources and build scripts' inputs by their times, and a
+// file a patch no longer changes gets the tarball's older time back, so
+// cargo would keep what it built from the patched one.
 func firecracker(t target, log io.Writer, sde int64) error {
 	w := "/cache/firecracker"
 	tree := w + "/src"
@@ -272,12 +282,12 @@ func firecracker(t target, log io.Writer, sde int64) error {
 	}
 	// The C parts build with musl-gcc, which has no kernel headers of its own.
 	cc := strings.ReplaceAll(triple, "-", "_")
-	env = append(env, "CARGO_TARGET_DIR="+w+"/target", "CC_"+cc+"=musl-gcc",
+	env = append(env, "CARGO_TARGET_DIR="+tree+"/target", "CC_"+cc+"=musl-gcc",
 		"CFLAGS_"+cc+"=-idirafter /usr/include -idirafter /usr/include/"+t.a+"-linux-gnu")
 	if err := run(log, tree, env, "/cache/cargo/bin/cargo", "build", "-q", "--release", "--locked", "--target", triple, "-p", "firecracker"); err != nil {
 		return err
 	}
-	return install(w+"/target/"+triple+"/release/firecracker", out+"/firecracker-"+t.a, 0o755)
+	return install(tree+"/target/"+triple+"/release/firecracker", out+"/firecracker-"+t.a, 0o755)
 }
 
 // The guest's root filesystem, a read-only EROFS image: Alpine, static
