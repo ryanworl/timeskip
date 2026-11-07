@@ -26,7 +26,7 @@ Build steps are cached by their inputs (see `step` in `cmd/build/main.go`). Chan
 | `internal/protocol/` | The host–guest control channel: control lines, the GO fields and the guest's reports |
 | `hv/` | `hvrun`, the macOS VMM on Hypervisor.framework (Swift) |
 | `guest/` | The kernel patch and configs, `init`, and `libvoidstar.c`, the library the Antithesis SDKs write their output through |
-| `firecracker/` | Patches to Firecracker: a paused VM's clock stands still, and a snapshot doesn't sync its disks |
+| `firecracker/` | Patches to Firecracker: a paused VM's clock stands still, a snapshot doesn't sync its disks, and a host disk error stops the VM |
 | `examples/` | The examples the kit ships |
 | `docs/reference.md` | The full user reference: conventions, scheduling, faults, results, internals and the protocol |
 | `e2e/` | The end-to-end tests, and in `testdata/protocol` a fixture for each of the protocol's cases |

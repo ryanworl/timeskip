@@ -270,6 +270,12 @@ final class Console: VirtioDevice {
 	}
 }
 
+// hostIO stops hvrun if a disk read or write (its result r) didn't
+// transfer all n bytes.
+func hostIO(_ r: Int, _ n: Int, _ what: String) {
+	if r != n { fail("disk \(what): " + (r < 0 ? String(cString: strerror(errno)) : "\(r) of \(n) bytes")) }
+}
+
 // A disk: a raw image file.
 final class Blk: VirtioDevice {
 	let id: UInt32 = 2
@@ -311,10 +317,17 @@ final class Blk: VirtioDevice {
 				let p = mem.ptr(d.addr, d.len)
 				// (Reads and writes past the end fail rather than grow the image.)
 				if UInt64(off) + UInt64(d.len) > capacity * 512 { status = 1; break }
+				// (The host failing a read or write, as a full disk does, is
+				// no fault of the guest's: hvrun stops, rather than the guest
+				// seeing an I/O error the test would blame on the project.)
 				if type == 0 {
-					if pread(fd, p, d.len, off) != d.len { status = 1 }
+					hostIO(pread(fd, p, d.len, off), d.len, "read")
 					written += d.len
-				} else if ro || pwrite(fd, p, d.len, off) != d.len { status = 1 }
+				} else if ro {
+					status = 1
+				} else {
+					hostIO(pwrite(fd, p, d.len, off), d.len, "write")
+				}
 				off += off_t(d.len)
 			}
 			mem.ptr(st.addr, 1).storeBytes(of: status, as: UInt8.self)

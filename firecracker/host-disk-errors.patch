@@ -1,0 +1,33 @@
+--- a/src/vmm/src/devices/virtio/block/virtio/request.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/request.rs
+@@ -155,6 +155,30 @@
+         res: Result<u32, IoErr>,
+         block_metrics: &BlockDeviceMetrics,
+     ) -> FinishedRequest {
++        // The host failing a read, write or flush (a full disk's ENOSPC, an
++        // EIO) is no fault of the guest's: firecracker exits, saying why, so
++        // that the timeline fails alone, rather than the guest seeing an I/O
++        // error its test would blame on the project.
++        let what = match self.r#type {
++            RequestType::In => "read",
++            RequestType::Out => "write",
++            RequestType::Flush => "flush",
++            _ => "",
++        };
++        if !what.is_empty() {
++            let failed = match &res {
++                Err(IoErr::FileEngine(err)) => Some(err.to_string()),
++                Err(err) => Some(format!("{err:?}")),
++                Ok(n) if self.r#type != RequestType::Flush && *n != self.data_len => {
++                    Some(format!("{n} of {} bytes", self.data_len))
++                }
++                Ok(_) => None,
++            };
++            if let Some(failed) = failed {
++                eprintln!("firecracker: disk {what}: {failed}");
++                std::process::exit(1);
++            }
++        }
+         let status = match (res, self.r#type) {
+             (Ok(transferred_data_len), RequestType::In) => {
+                 let status = Status::from_data(self.data_len, transferred_data_len, true);
