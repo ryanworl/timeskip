@@ -922,6 +922,14 @@ func TestProtocol(t *testing.T) {
 				if !regexp.MustCompile(`(?m)^-\d+\.\d{3}s ticker-1 stderr ticker starts$`).MatchString(logs) {
 					t.Errorf("no stderr line from setup in the containers' logs %q:\n%.2000s", r.Timelines[0].ContainerLogs, logs)
 				}
+				for _, l := range []string{"ticker-1 stdout long " + strings.Repeat("a", 40000), `ticker-1 stdout nul a\x00b c\\x00d e\\\x00f`} {
+					if !regexp.MustCompile(`(?m)^-\d+\.\d{3}s ` + regexp.QuoteMeta(l) + `$`).MatchString(logs) {
+						t.Errorf("no line %.60q from setup in the containers' logs %q", l, r.Timelines[0].ContainerLogs)
+					}
+				}
+				if n := len(regexp.MustCompile(`(?m)^[-+]\d+\.\d{3}s once-1 stdout unended$`).FindAllString(logs, -1)); n != 2 {
+					t.Errorf("%d lines \"once-1 stdout unended\" in the containers' logs %q, want 2 (one per run)", n, r.Timelines[0].ContainerLogs)
+				}
 				var lag, jump []float64
 				for _, m := range regexp.MustCompile(`(?m)^\+(\d+\.\d{3})s ticker-1 stdout tick (\d+\.\d+) (\d+)$`).FindAllStringSubmatch(logs, -1) {
 					at, _ := strconv.ParseFloat(m[1], 64)
