@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,10 +76,9 @@ func do(method, path, ctype string, body io.Reader) (*http.Response, error) {
 // the signals Docker sent them, from its kill events.
 var exits struct {
 	sync.Mutex
-	once    sync.Once
-	l       []exit
-	started map[string]int // where each container's latest start came, in l (see claimDeath)
-	marks   map[string]int // where each mark came, in l (see mark)
+	once  sync.Once
+	l     []exit
+	marks map[string]int // where each mark came, in l (see mark)
 }
 
 var markSeq atomic.Uint64
@@ -106,12 +107,16 @@ func (e exit) String() string { return e.name + " exited with code " + e.code }
 // watchExits records the exits from now on, from Docker's events.
 func watchExits() {
 	exits.once.Do(func() {
-		f, _ := json.Marshal(map[string][]string{"type": {"container"}, "event": {"die", "kill", "start", "exec_create"}, "label": {"com.docker.compose.project=" + project}})
+		// (The project's containers' events, and marks: volumes' (see
+		// markEvents), which have no labels, so the project's label is
+		// matched here.)
+		f, _ := json.Marshal(map[string][]string{"type": {"container", "volume"}, "event": {"die", "kill", "exec_create", "create"}})
 		resp, err := do("GET", "/events?filters="+url.QueryEscape(string(f)), "", nil)
 		check(err)
 		go func() {
 			for d := json.NewDecoder(resp.Body); ; {
 				var e struct {
+					Type   string
 					Action string
 					Actor  struct {
 						ID         string
@@ -122,16 +127,21 @@ func watchExits() {
 					return
 				}
 				a := e.Actor.Attributes
+				if e.Type == "container" && a["com.docker.compose.project"] != project {
+					continue
+				}
 				exits.Lock()
 				switch {
-				case e.Action == "start":
-					if exits.started == nil {
-						exits.started = map[string]int{}
+				case e.Type == "volume":
+					if tok, ok := strings.CutPrefix(e.Actor.ID, "timeskip-mark-"); ok && e.Action == "create" {
+						if exits.marks == nil {
+							exits.marks = map[string]int{}
+						}
+						exits.marks[tok] = len(exits.l)
 					}
-					exits.started[e.Actor.ID] = len(exits.l)
 				case e.Action == "die" || e.Action == "kill":
 					exits.l = append(exits.l, exit{id: e.Actor.ID, name: a["name"], code: a["exitCode"], kill: e.Action == "kill"})
-				default: // ("exec_create: CMD ARGS", as a test command's)
+				default: // ("exec_create: CMD ARGS", as a test command's; "create")
 					if tok, ok := strings.CutPrefix(e.Action, "exec_create: true timeskip-mark "); ok {
 						if exits.marks == nil {
 							exits.marks = map[string]int{}
@@ -179,22 +189,15 @@ func claimExits(id string, n int, keep ...string) {
 
 // claimDeath marks the exit of container c that its state shows, an
 // error's (see errExit), and its other exits after the first n, as a
-// fault's doing (see claimExits), once Docker has logged it: Docker sets
-// the state before it logs the die event, so it waits up to 5 s for the
-// event of that death, the first with its code since the container last
-// started (an earlier death's, one another fault claimed and started it
-// again after, came before that start).
+// fault's doing (see claimExits), once they're recorded: Docker logs the
+// die event before its state shows the exit (both under the container's
+// lock), so a mark made since (see markEvents) comes after the events of
+// each of c's runs so far that Docker delivered. Without a mark, it claims
+// none, and says so: the exit stays an unexpected one.
 func claimDeath(c container, n int) {
-	code := strconv.Itoa(c.State.ExitCode)
-	for t := time.Now(); time.Since(t) < 5*time.Second; time.Sleep(10 * time.Millisecond) {
-		exits.Lock()
-		ok := slices.ContainsFunc(exits.l[max(n, exits.started[c.ID]):], func(e exit) bool {
-			return e.id == c.ID && !e.kill && e.code == code
-		})
-		exits.Unlock()
-		if ok {
-			break
-		}
+	if _, ok := markEvents(); !ok {
+		say("fault: no mark in Docker's events for %s's exit: it isn't claimed (an unexpected exit)", c.Name)
+		return
 	}
 	claimExits(c.ID, n, "132", "139")
 }
@@ -217,14 +220,46 @@ func takeExit(id string, n int, match func(exit) bool) bool {
 // mark is how many exits had been recorded once every event Docker logged
 // for container c before now was (an index in exits.l), and whether there
 // was a mark: Docker logs its events in order, and mark has it log one of
-// its own, creating an exec in c that never starts, and waits up to 5 s for
-// it. (Docker logs an exit before it can start the container again, so
-// that, with c frozen, the exits after the mark are of c's current run.)
+// its own, creating an exec in c that never starts. (Docker logs an exit
+// before it can start the container again, so that, with c frozen, the
+// exits after the mark are of c's current run.) Docker drops an event for
+// a subscriber that takes none for 100 ms, though, with 1024 waiting: the
+// mark orders the events that were delivered.
 func mark(c container) (int, bool) {
 	tok := strconv.FormatUint(markSeq.Add(1), 10)
 	if call("POST", "/containers/"+c.ID+"/exec", map[string][]string{"Cmd": {"true", "timeskip-mark", tok}}, nil) != nil {
 		return 0, false
 	}
+	return awaitMark(tok)
+}
+
+// markEvents is as mark, but for every event Docker logged before now, of
+// any container, running or not: Docker logs a volume's create event
+// before it returns, and markEvents creates one, timeskip-mark-HEX, a
+// random name nothing else has, and removes it again (its destroy event
+// isn't watched) once its event has shown that this create made it.
+// Docker creates nothing for a name a volume has, and logs no event: then
+// it's left alone. (A workload's own volume listing, or a prune, may see
+// it meanwhile.)
+func markEvents() (int, bool) {
+	b := make([]byte, 16)
+	rand.Read(b)
+	tok := hex.EncodeToString(b)
+	if call("POST", "/volumes/create", map[string]string{"Name": "timeskip-mark-" + tok}, nil) != nil {
+		return 0, false
+	}
+	i, ok := awaitMark(tok)
+	if ok {
+		if err := call("DELETE", "/volumes/timeskip-mark-"+tok, nil, nil); err != nil {
+			say("fault: removing volume timeskip-mark-%s, a mark: %v", tok, err)
+		}
+	}
+	return i, ok
+}
+
+// awaitMark waits up to 5 s for mark tok's event, and is how many exits
+// had been recorded by then, and whether it came.
+func awaitMark(tok string) (int, bool) {
 	for t := time.Now(); time.Since(t) < 5*time.Second; time.Sleep(time.Millisecond) {
 		exits.Lock()
 		i, ok := exits.marks[tok]
