@@ -125,39 +125,40 @@
 +}
 --- a/kernel/time/timekeeping.c
 +++ b/kernel/time/timekeeping.c
-@@ -711,6 +711,38 @@
+@@ -711,6 +711,39 @@
  }
  
  /**
 + * timekeeping_skip - advance every clock by @nsecs without the clocksource moving
-+ * @nsecs:	nanoseconds to skip
++ * @nsecs:	nanoseconds of CLOCK_MONOTONIC to skip
 + *
-+ * Unlike sleep time injection, this moves CLOCK_MONOTONIC and
-+ * CLOCK_MONOTONIC_RAW forward as well as CLOCK_REALTIME and CLOCK_BOOTTIME,
-+ * so to the whole system the skipped interval looks like ordinary elapsed
-+ * time. Offsets between the clocks do not change, so hrtimer bases need no
-+ * clock_was_set() notification. The vDSO data is refreshed here, so
-+ * userspace clock reads stay on the fast path.
++ * The timekeeper accumulates the skipped interval as if the clocksource
++ * had counted through it: the cycles @nsecs take at the current,
++ * NTP-adjusted rate (rounded up) are added to the cycles since its last
++ * update, and it catches up at once, as after a long idle. So to the whole
++ * system the skip looks like ordinary elapsed time: CLOCK_MONOTONIC moves
++ * by @nsecs, CLOCK_MONOTONIC_RAW by those cycles at its own rate, and NTP's
++ * frequency, slew and leap seconds apply to the skipped seconds too.
++ * Catching up at once also keeps the vDSO's cycle delta small. Called
++ * with interrupts off.
 + */
++static bool timekeeping_advance(enum timekeeping_adv_mode mode);
++
 +void timekeeping_skip(u64 nsecs)
 +{
-+	struct timekeeper *tk = &tk_core.timekeeper;
-+	struct timespec64 ts = ns_to_timespec64(nsecs);
++	struct timekeeper *tk = &shadow_timekeeper;
++	struct tk_read_base *tkr = &tk->tkr_mono;
 +	unsigned long flags;
++	u64 cycles;
 +
 +	raw_spin_lock_irqsave(&timekeeper_lock, flags);
-+	write_seqcount_begin(&tk_core.seq);
-+
-+	timekeeping_forward_now(tk);
-+	tk_xtime_add(tk, &ts);
-+	tk->raw_sec += ts.tv_sec;
-+	tk->tkr_raw.xtime_nsec += (u64)ts.tv_nsec << tk->tkr_raw.shift;
-+	tk_normalize_xtime(tk);
-+
-+	timekeeping_update(tk, TK_MIRROR);
-+
-+	write_seqcount_end(&tk_core.seq);
++	cycles = mul_u64_u64_div_u64(nsecs, 1ULL << tkr->shift, tkr->mult) + 1;
++	tkr->cycle_last = (tkr->cycle_last - cycles) & tkr->mask;
++	tk->tkr_raw.cycle_last = tkr->cycle_last;
 +	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
++
++	if (timekeeping_advance(TK_ADV_FREQ))
++		clock_was_set_delayed();
 +}
 +
 +/**
