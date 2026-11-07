@@ -677,6 +677,9 @@ func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() erro
 				return func(e exit) bool { return c.seq < e.boot }
 			}
 			claim := func(c crash) bool {
+				if c.sig == int(syscall.SIGILL) || c.sig == int(syscall.SIGSEGV) { // (as a disk fault's exits: see errExit)
+					return false
+				}
 				for _, match := range []func(crash) func(exit) bool{code, cut} {
 					if d := disks[c.cgroup]; d != nil && slices.Contains(ds, d) && hit(d) && takeExit(c.cgroup, n, match(c)) {
 						return true

@@ -811,15 +811,15 @@ func (r *runner) crashSeq() int {
 }
 
 // claimCrashes marks the crashes since record from that claim takes, in
-// order, as a fault's doing, but deaths of SIGILL or SIGSEGV (as a fault's
-// exits: see errExit) and those of no cgroup, and returns what they say.
+// order, as a fault's doing, but those of no cgroup, and returns what they
+// say.
 func (r *runner) claimCrashes(from int, claim func(crash) bool) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.readCrashes()
 	var l []string
 	for i := range r.crashed {
-		if c := &r.crashed[i]; c.seq > from && !c.claimed && c.cgroup != "" && c.sig != int(syscall.SIGILL) && c.sig != int(syscall.SIGSEGV) && claim(*c) {
+		if c := &r.crashed[i]; c.seq > from && !c.claimed && c.cgroup != "" && claim(*c) {
 			c.claimed = true
 			l = append(l, c.text)
 		}

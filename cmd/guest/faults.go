@@ -836,8 +836,11 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 			return err
 		}
 	}
-	var gone, signaled sync.Map
-	n := exitCount()
+	var gone, signaled, killed, marked sync.Map
+	n, seq := exitCount(), 0
+	if f.Kind == "stop" {
+		seq = in.r.crashSeq()
+	}
 	ok, err := each(all, func(c container) error {
 		in.r.downed(c, f.Kind != "pause")
 		// A stop's exit is its doing, whatever its code, if the process
@@ -853,18 +856,37 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 		// signal is the stop's, as in Antithesis. If its process had
 		// exited already (a crash, which Docker may not have noticed: it
 		// still signals it), or Docker sent no signal, nothing after is the
-		// stop's.
+		// stop's. Frozen, the events Docker logged before its mark (see
+		// mark) are of its earlier runs: its signal and exit are those
+		// after the mark (without one, after the fault began).
 		var sent chan bool
+		from, m := seq, n // (the kernel's log's last record before it could die of the signal; Docker's events')
 		ended := make(chan struct{})
 		if f.Kind == "stop" {
 			in.r.pausing(c, true) // (see runner.enter)
 			thaw, ok, none := frozen(c)
-			if code, takes := stopExits(c); takes && ok && !none {
+			if ok {
+				from = in.r.crashSeq() // (frozen, it can't log a death until Docker's signal)
+			}
+			var current bool
+			if ok && !none {
+				if m, current = mark(c); current {
+					marked.Store(c.ID, m)
+				} else {
+					m = n
+				}
+			}
+			code, takes := stopExits(c)
+			takes = takes && ok && !none
+			if takes {
 				signaled.Store(c.ID, code)
 			}
 			sent = make(chan bool, 1)
 			go func() {
-				k := none || ok && awaitKill(c.ID, n, ended)
+				k := none || ok && awaitKill(c.ID, m, ended)
+				if k && takes && current { // (signaled while frozen: see claimCrashes below)
+					killed.Store(c.ID, [3]int{int(stopSignal(c.Config.StopSignal)), from, m})
+				}
 				thaw()
 				in.r.pausing(c, false)
 				sent <- k
@@ -879,7 +901,7 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 			if !<-sent { // (a signal it sent unfrozen, if any: Docker reports it soon after its stop returns)
 				late := make(chan struct{})
 				time.AfterFunc(5*time.Second, func() { close(late) })
-				if awaitKill(c.ID, n, late) {
+				if awaitKill(c.ID, m, late) {
 					signaled.Store(c.ID, "")
 				}
 			}
@@ -915,7 +937,23 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 	if f.Kind == "stop" {
 		codes := map[string]string{}
 		signaled.Range(func(id, code any) bool { codes[id.(string)] = code.(string); return true })
-		signaledExits(slices.DeleteFunc(slices.Clone(ok), func(c container) bool { _, s := codes[c.ID]; return !s }), codes, n)
+		marks := map[string]int{}
+		marked.Range(func(id, m any) bool { marks[id.(string)] = m.(int); return true })
+		signaledExits(slices.DeleteFunc(slices.Clone(ok), func(c container) bool { _, s := codes[c.ID]; return !s }), codes, n, marks)
+		// A process that the stop's signal killed (a core-dumping one,
+		// such as SIGQUIT or SIGABRT as stop signals, forwarded by an init
+		// to its child) died of the stop, not a crash: one death of it in a
+		// container that took the signal, signaled while frozen, that the
+		// kernel logged after it froze, for the container's exit after the
+		// signal if that is a death by it (128+N) no other crash took (see
+		// takeSignaledExit), both after its mark. If the container didn't
+		// freeze, or got no mark, or Docker's signal wasn't confirmed while
+		// it was frozen, a death of it may have come before the signal: it
+		// stays a crash.
+		in.r.claimCrashes(seq, func(cr crash) bool {
+			k, ok := killed.Load(cr.cgroup)
+			return ok && cr.sig == k.([3]int)[0] && cr.seq > k.([3]int)[1] && takeSignaledExit(cr.cgroup, k.([3]int)[2], strconv.Itoa(128+cr.sig))
+		})
 	}
 	done := map[string]bool{}
 	for _, c := range ok {

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -76,14 +77,17 @@ var exits struct {
 	once    sync.Once
 	l       []exit
 	started map[string]int // where each container's latest start came, in l (see claimDeath)
+	marks   map[string]int // where each mark came, in l (see mark)
 }
+
+var markSeq atomic.Uint64
 
 // exit is a container's exit, fault if a fault caused it (see claimExit
 // and signaledExits); or, if kill, a signal Docker sent it.
 type exit struct {
 	id, name, code string
 	fault, kill    bool
-	taken          bool // matched to a crash (see takeExit)
+	taken          bool // matched to a crash (see takeExit and takeSignaledExit)
 	boot           int  // a disk fault's reboot's kill: the kernel log's sequence number before it, plus 1 (see markBoot)
 }
 
@@ -102,7 +106,7 @@ func (e exit) String() string { return e.name + " exited with code " + e.code }
 // watchExits records the exits from now on, from Docker's events.
 func watchExits() {
 	exits.once.Do(func() {
-		f, _ := json.Marshal(map[string][]string{"type": {"container"}, "event": {"die", "kill", "start"}, "label": {"com.docker.compose.project=" + project}})
+		f, _ := json.Marshal(map[string][]string{"type": {"container"}, "event": {"die", "kill", "start", "exec_create"}, "label": {"com.docker.compose.project=" + project}})
 		resp, err := do("GET", "/events?filters="+url.QueryEscape(string(f)), "", nil)
 		check(err)
 		go func() {
@@ -119,13 +123,21 @@ func watchExits() {
 				}
 				a := e.Actor.Attributes
 				exits.Lock()
-				if e.Action == "start" {
+				switch {
+				case e.Action == "start":
 					if exits.started == nil {
 						exits.started = map[string]int{}
 					}
 					exits.started[e.Actor.ID] = len(exits.l)
-				} else {
+				case e.Action == "die" || e.Action == "kill":
 					exits.l = append(exits.l, exit{id: e.Actor.ID, name: a["name"], code: a["exitCode"], kill: e.Action == "kill"})
+				default: // ("exec_create: CMD ARGS", as a test command's)
+					if tok, ok := strings.CutPrefix(e.Action, "exec_create: true timeskip-mark "); ok {
+						if exits.marks == nil {
+							exits.marks = map[string]int{}
+						}
+						exits.marks[tok] = len(exits.l)
+					}
 				}
 				exits.Unlock()
 			}
@@ -202,6 +214,49 @@ func takeExit(id string, n int, match func(exit) bool) bool {
 	return false
 }
 
+// mark is how many exits had been recorded once every event Docker logged
+// for container c before now was (an index in exits.l), and whether there
+// was a mark: Docker logs its events in order, and mark has it log one of
+// its own, creating an exec in c that never starts, and waits up to 5 s for
+// it. (Docker logs an exit before it can start the container again, so
+// that, with c frozen, the exits after the mark are of c's current run.)
+func mark(c container) (int, bool) {
+	tok := strconv.FormatUint(markSeq.Add(1), 10)
+	if call("POST", "/containers/"+c.ID+"/exec", map[string][]string{"Cmd": {"true", "timeskip-mark", tok}}, nil) != nil {
+		return 0, false
+	}
+	for t := time.Now(); time.Since(t) < 5*time.Second; time.Sleep(time.Millisecond) {
+		exits.Lock()
+		i, ok := exits.marks[tok]
+		delete(exits.marks, tok)
+		exits.Unlock()
+		if ok {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// takeSignaledExit marks the exit of container id that follows the first
+// signal Docker sent it after the first n exits (a stop's: see
+// signaledExits) as taken by a crash, if its code is code and no crash took
+// it yet, and is whether it did.
+func takeSignaledExit(id string, n int, code string) bool {
+	exits.Lock()
+	defer exits.Unlock()
+	l := exits.l[n:]
+	k := slices.IndexFunc(l, func(e exit) bool { return e.id == id && e.kill })
+	if k < 0 {
+		return false
+	}
+	i := slices.IndexFunc(l[k:], func(e exit) bool { return e.id == id && !e.kill })
+	if i < 0 || l[k+i].taken || l[k+i].code != code {
+		return false
+	}
+	l[k+i].taken = true
+	return true
+}
+
 // markBoot marks container id's first exit after the first m, waiting up to
 // 5 s for it, as a disk fault's reboot's kill, sent once the kernel's log
 // had reached record bound: a crash logged by then may be one it cut short.
@@ -225,14 +280,14 @@ func markBoot(id string, m, bound int) {
 // first signal Docker sent it after the first n exits (a stop fault's
 // signal: Docker logs the signal before the exit it causes), as the
 // fault's doing, if its code is the container's in codes ("": any code),
-// waiting up to 5 s for Docker's events. An exit before the signal, a
-// crash's that the stop came after, stays unexpected, as does one with
-// another code.
-func signaledExits(cs []container, codes map[string]string, n int) {
+// waiting up to 5 s for Docker's events, or after its mark in marks (see
+// mark), if it has one. An exit before the signal, a crash's that the stop
+// came after, stays unexpected, as does one with another code.
+func signaledExits(cs []container, codes map[string]string, n int, marks map[string]int) {
 	for t := time.Now(); len(cs) > 0 && time.Since(t) < 5*time.Second; time.Sleep(10 * time.Millisecond) {
 		exits.Lock()
 		cs = slices.DeleteFunc(cs, func(c container) bool {
-			l := exits.l[n:]
+			l := exits.l[max(n, marks[c.ID]):]
 			k := slices.IndexFunc(l, func(e exit) bool { return e.id == c.ID && e.kill })
 			if k < 0 {
 				return false
