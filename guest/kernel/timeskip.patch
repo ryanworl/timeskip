@@ -975,6 +975,27 @@
  	if (file->f_op->fsync && !(lo->lo_flags & LO_FLAGS_READ_ONLY))
  		lim->features |= BLK_FEAT_WRITE_CACHE;
  	if (backing_bdev && !bdev_nonrot(backing_bdev))
+@@ -1841,13 +2126,13 @@
+ #ifdef CONFIG_BLK_CGROUP
+ 	if (rq->bio) {
+ 		cmd->blkcg_css = bio_blkcg_css(rq->bio);
+-#ifdef CONFIG_MEMCG
+-		if (cmd->blkcg_css) {
+-			cmd->memcg_css =
+-				cgroup_get_e_css(cmd->blkcg_css->cgroup,
+-						&memory_cgrp_subsys);
+-		}
+-#endif
++		/*
++		 * (timeskip: but not its memcg. What the loop worker allocates
++		 * as it writes, the backing file's filesystem's blocks and
++		 * metadata, would be charged to the cgroup whose pages it's
++		 * writing back; one full of them then frees none and is
++		 * OOM-killed, where a host's disk writes back charging none.)
++		 */
+ 	}
+ #endif
+ 	loop_queue_work(lo, cmd);
 @@ -1974,6 +2259,9 @@
  		goto out;
  	lo->worker_tree = RB_ROOT;
