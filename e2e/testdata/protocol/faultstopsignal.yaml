@@ -1,0 +1,67 @@
+# expect: 0. A stop sends the container's own stop signal (an image's
+# STOPSIGNAL or a service's stop_signal, as the postgres image's SIGINT),
+# and its exits don't count, as in Antithesis: catcher catches its SIGINT
+# and exits 3; initcatcher's init (init: true, Docker's tini) forwards its
+# SIGINT to sh, which catches it and exits 3, and init exits 3 too (init
+# also adopted a sleep, which doesn't catch SIGINT: the code is its own
+# child's, whichever comes first in /proc); hostcatcher has init: true
+# but pid: host, so Docker inserts no init, and it catches its SIGINT and
+# exits 3 itself; waiter ignores and blocks its SIGTERM and takes it with
+# sigwait, as mongod does (mongod without ignoring it), so it's not in
+# SigCgt, and exits 3;
+# quitter doesn't catch its SIGUSR1, which its init forwards to sleep, so
+# it exits 138 (128+10). The driver runs until node faults have started
+# each again twice (or 120 s).
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --seed 14
+volumes: {shared: {}}
+x-timeskip:
+  faults: high_availability
+  fault_gap: 1
+services:
+  catcher:
+    image: busybox:1.36
+    stop_signal: SIGINT
+    volumes: [shared:/shared]
+    command: [sh, -c, "echo boot >> /shared/catcher; trap 'exit 3' INT; sleep 2147483647 & wait"]
+  initcatcher:
+    image: busybox:1.36
+    init: true
+    stop_signal: SIGINT
+    volumes: [shared:/shared]
+    command: [sh, -c, "echo boot >> /shared/initcatcher; sh -c 'sleep 2147483647 &'; trap 'exit 3' INT; sleep 2147483647 & wait"]
+  hostcatcher:
+    image: busybox:1.36
+    init: true
+    pid: host
+    stop_signal: SIGINT
+    volumes: [shared:/shared]
+    command: [sh, -c, "echo boot >> /shared/hostcatcher; trap 'exit 3' INT; sleep 2147483647 & wait"]
+  waiter:
+    image: python:3.12-alpine
+    volumes: [shared:/shared]
+    command: [python3, -c, "import signal, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}); open('/shared/waiter', 'a').write('boot\\n'); signal.sigwait({signal.SIGTERM}); sys.exit(3)"]
+  quitter:
+    image: busybox:1.36
+    init: true
+    stop_signal: SIGUSR1
+    volumes: [shared:/shared]
+    command: [sh, -c, "echo boot >> /shared/quitter; exec sleep 2147483647"]
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    volumes: [shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/singleton_driver_x <<'X'
+        #!/bin/sh
+        n() { wc -l < /shared/$$1; }
+        i=0; until [ $$(n catcher) -ge 3 ] && [ $$(n initcatcher) -ge 3 ] && [ $$(n hostcatcher) -ge 3 ] && [ $$(n waiter) -ge 3 ] && [ $$(n quitter) -ge 3 ] || [ $$i -ge 600 ]; do sleep 0.2; i=$$((i + 1)); done
+        X
+        chmod +x $$d/singleton_driver_x
+        until [ -s /shared/catcher ] && [ -s /shared/initcatcher ] && [ -s /shared/hostcatcher ] && [ -s /shared/waiter ] && [ -s /shared/quitter ]; do sleep 0.2; done
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

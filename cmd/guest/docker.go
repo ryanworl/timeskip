@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -154,10 +156,12 @@ func claimExits(id string, n int, keep ...string) {
 
 // signaledExits marks the exit of each of the containers that follows the
 // first signal Docker sent it after the first n exits (a stop fault's
-// SIGTERM: Docker logs the signal before the exit it causes), as the
-// fault's doing, waiting up to 5 s for Docker's events. An exit before the
-// signal, a crash's that the stop came after, stays unexpected.
-func signaledExits(cs []container, n int) {
+// signal: Docker logs the signal before the exit it causes), as the
+// fault's doing, if its code is the container's in codes ("": any code),
+// waiting up to 5 s for Docker's events. An exit before the signal, a
+// crash's that the stop came after, stays unexpected, as does one with
+// another code.
+func signaledExits(cs []container, codes map[string]string, n int) {
 	for t := time.Now(); len(cs) > 0 && time.Since(t) < 5*time.Second; time.Sleep(10 * time.Millisecond) {
 		exits.Lock()
 		cs = slices.DeleteFunc(cs, func(c container) bool {
@@ -167,7 +171,7 @@ func signaledExits(cs []container, n int) {
 				return false
 			}
 			i := slices.IndexFunc(l[k:], func(e exit) bool { return e.id == c.ID && !e.fault && !e.kill })
-			if i >= 0 {
+			if i >= 0 && (codes[c.ID] == "" || l[k+i].code == codes[c.ID]) {
 				l[k+i].fault = true
 			}
 			return i >= 0
@@ -176,25 +180,177 @@ func signaledExits(cs []container, n int) {
 	}
 }
 
-// catchesTerm is whether container c's process is running (not exited, nor
-// a zombie) and catches SIGTERM, so that a stop may make it exit with a code
-// of its own.
-func catchesTerm(c container) bool {
+// frozen freezes container c's cgroup until the returned func is called,
+// and is whether it froze (cgroup.events says frozen 1) within 1 s; if
+// not, it thaws it again at once. Frozen, its processes can't exec, and
+// their signal dispositions stay as they are, while a stop reads them and
+// Docker signals them (a signal to a frozen process is taken or dropped
+// as it's sent, by them).
+func frozen(c container) (thaw func(), ok bool) {
+	thaw = func() {}
 	var d container
 	if call("GET", "/containers/"+c.ID+"/json", nil, &d) != nil || d.State.Pid == 0 {
-		return false
+		return thaw, false
 	}
-	b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/status", d.State.Pid))
-	var state, caught string
-	for _, l := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(l, "State:"); ok {
-			state = strings.TrimSpace(v)
-		} else if v, ok := strings.CutPrefix(l, "SigCgt:"); ok {
-			caught = strings.TrimSpace(v)
+	dir, err := cgroupDir(d)
+	if err != nil || os.WriteFile(dir+"/cgroup.freeze", []byte("1"), 0) != nil {
+		return thaw, false
+	}
+	thaw = func() { os.WriteFile(dir+"/cgroup.freeze", []byte("0"), 0) }
+	for t := time.Now(); time.Since(t) < time.Second; time.Sleep(time.Millisecond) {
+		if b, _ := os.ReadFile(dir + "/cgroup.events"); strings.Contains(string(b), "frozen 1") {
+			return thaw, true
 		}
 	}
-	m, err := strconv.ParseUint(caught, 16, 64)
-	return err == nil && state != "" && state[0] != 'Z' && state[0] != 'X' && m&(1<<(syscall.SIGTERM-1)) != 0
+	thaw() // (a task that doesn't freeze, as in an uninterruptible sleep)
+	return func() {}, false
+}
+
+// awaitKill is whether Docker reports a signal it sent container id after
+// the first n exits within 5 s, waiting for it, but no longer than until
+// ended is closed and there's none.
+func awaitKill(id string, n int, ended <-chan struct{}) bool {
+	for t := time.Now(); time.Since(t) < 5*time.Second; time.Sleep(time.Millisecond) {
+		exits.Lock()
+		k := slices.ContainsFunc(exits.l[n:], func(e exit) bool { return e.id == id && e.kill })
+		exits.Unlock()
+		select {
+		case <-ended:
+			return k
+		default:
+		}
+		if k {
+			return true
+		}
+	}
+	return false
+}
+
+// stopExits is which exit codes of container c a stop may cause beyond 143
+// and 137 (ok false: none), as Docker's stop sends its stop signal (SIGTERM,
+// unless the image's STOPSIGNAL or the service's stop_signal names
+// another, such as the postgres image's SIGINT): any code ("") if its
+// process is running (not exited, nor a zombie) and takes the signal
+// itself (see takes); else, for a signal other than SIGTERM, the code of a
+// death by it, 128+N.
+// With init: true, in a PID namespace of the container's own (Docker
+// inserts no init with pid: host or another container's), any code:
+// Docker signals its init (tini), which forwards the signal to its child
+// only once it has taken it itself, after the stop's freeze ends, so what
+// the child does with it can't be known beforehand; and init exits with
+// the child's code.
+func stopExits(c container) (code string, ok bool) {
+	var d container
+	if call("GET", "/containers/"+c.ID+"/json", nil, &d) != nil || d.State.Pid == 0 {
+		return "", false
+	}
+	if m := d.HostConfig.PidMode; d.HostConfig.Init && m != "host" && !strings.HasPrefix(m, "container:") {
+		return "", true
+	}
+	pid := d.State.Pid
+	sig := stopSignal(d.Config.StopSignal)
+	if sig != 0 && takes(pid, uint64(1)<<(sig-1)) {
+		return "", true
+	}
+	if sig != 0 && sig != syscall.SIGTERM {
+		return strconv.Itoa(128 + int(sig)), true
+	}
+	return "", false
+}
+
+// takes is whether process pid is running (not exited, nor a zombie) and
+// takes the signal of mask bit itself: with a handler (SigCgt), or by
+// sigwait or a signalfd, as mongod does, even if it's ignored (SigIgn: the
+// kernel delivers a blocked signal to sigwait whatever its disposition, as
+// kernel/signal.c's sig_ignored checks blocked and real_blocked first). Both
+// need it blocked: it's in some thread's SigBlk (each thread has its own mask;
+// a signalfd reader's stays blocked), or a thread waits for it in
+// rt_sigtimedwait, which unblocks the signals it waits for meanwhile, so
+// that thread's set is read from the process's memory at the call's
+// first argument. A thread that's running shows "running" in its syscall
+// file, not a call, and a set that can't be read counts as not taking it.
+// (A process that blocks it and never takes it is killed after the stop's
+// timeout, 137, which counts anyway.) It reads each thread's files once,
+// as a stop starts.
+func takes(pid int, bit uint64) bool {
+	field := func(b []byte, k string) string {
+		for _, l := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(l, k+":"); ok {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
+	hex := func(b []byte, k string) uint64 { m, _ := strconv.ParseUint(field(b, k), 16, 64); return m }
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if state := field(b, "State"); err != nil || state == "" || state[0] == 'Z' || state[0] == 'X' {
+		return false
+	}
+	if hex(b, "SigCgt")&bit != 0 {
+		return true
+	}
+	nr := map[string]string{"arm64": "137", "amd64": "128"}[runtime.GOARCH] // (rt_sigtimedwait)
+	tasks, _ := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	for _, t := range tasks {
+		dir := fmt.Sprintf("/proc/%d/task/%s/", pid, t.Name())
+		if b, _ := os.ReadFile(dir + "status"); hex(b, "SigBlk")&bit != 0 {
+			return true
+		}
+		b, _ := os.ReadFile(dir + "syscall")
+		if f := strings.Fields(string(b)); len(f) > 1 && f[0] == nr {
+			if at, err := strconv.ParseUint(strings.TrimPrefix(f[1], "0x"), 16, 64); err == nil {
+				var set [8]byte
+				if f, err := os.Open(fmt.Sprintf("/proc/%d/mem", pid)); err == nil {
+					n, _ := f.ReadAt(set[:], int64(at))
+					f.Close()
+					if n == 8 && binary.LittleEndian.Uint64(set[:])&bit != 0 {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// stopSignal is the number of a container's stop signal as Docker names it
+// ("SIGINT", "INT", "2" or "SIGRTMIN+3"; "": SIGTERM), or 0 for a name it
+// doesn't know.
+func stopSignal(name string) syscall.Signal {
+	if name == "" {
+		return syscall.SIGTERM
+	}
+	if n, err := strconv.Atoi(name); err == nil {
+		if n > 0 && n <= 64 {
+			return syscall.Signal(n)
+		}
+		return 0
+	}
+	name = strings.TrimPrefix(strings.ToUpper(name), "SIG")
+	// (Docker's real-time signals: RTMIN is 34, as glibc keeps 32 and 33.)
+	if v, ok := strings.CutPrefix(name, "RTMIN+"); ok {
+		if k, err := strconv.Atoi(v); err == nil && k >= 0 && k <= 30 {
+			return syscall.Signal(34 + k)
+		}
+		return 0
+	}
+	if v, ok := strings.CutPrefix(name, "RTMAX-"); ok {
+		if k, err := strconv.Atoi(v); err == nil && k >= 0 && k <= 30 {
+			return syscall.Signal(64 - k)
+		}
+		return 0
+	}
+	return map[string]syscall.Signal{
+		"HUP": syscall.SIGHUP, "INT": syscall.SIGINT, "QUIT": syscall.SIGQUIT, "ILL": syscall.SIGILL,
+		"TRAP": syscall.SIGTRAP, "ABRT": syscall.SIGABRT, "IOT": syscall.SIGIOT, "BUS": syscall.SIGBUS,
+		"FPE": syscall.SIGFPE, "KILL": syscall.SIGKILL, "USR1": syscall.SIGUSR1, "SEGV": syscall.SIGSEGV,
+		"USR2": syscall.SIGUSR2, "PIPE": syscall.SIGPIPE, "ALRM": syscall.SIGALRM, "TERM": syscall.SIGTERM,
+		"STKFLT": syscall.SIGSTKFLT, "CHLD": syscall.SIGCHLD, "CLD": syscall.SIGCLD, "CONT": syscall.SIGCONT,
+		"STOP": syscall.SIGSTOP, "TSTP": syscall.SIGTSTP, "TTIN": syscall.SIGTTIN, "TTOU": syscall.SIGTTOU,
+		"URG": syscall.SIGURG, "XCPU": syscall.SIGXCPU, "XFSZ": syscall.SIGXFSZ, "VTALRM": syscall.SIGVTALRM,
+		"PROF": syscall.SIGPROF, "WINCH": syscall.SIGWINCH, "IO": syscall.SIGIO, "POLL": syscall.SIGPOLL,
+		"PWR": syscall.SIGPWR, "SYS": syscall.SIGSYS, "RTMIN": 34, "RTMAX": 64,
+	}[name]
 }
 
 // container is what the agent needs of a container's inspect document.
@@ -207,8 +363,15 @@ type container struct {
 		ExitCode int
 		Health   *struct{ Status string }
 	}
-	Config          struct{ Labels map[string]string }
-	HostConfig      struct{ NetworkMode string }
+	Config struct {
+		Labels     map[string]string
+		StopSignal string
+	}
+	HostConfig struct {
+		NetworkMode string
+		Init        bool
+		PidMode     string
+	}
 	Mounts          []mount
 	NetworkSettings struct {
 		Networks map[string]struct{ IPAddress string }

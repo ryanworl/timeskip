@@ -841,16 +841,42 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 	ok, err := each(all, func(c container) error {
 		in.r.downed(c, f.Kind != "pause")
 		// A stop's exit is its doing, whatever its code, if the process
-		// catches SIGTERM (else it's 143, or 137 after the timeout); a
-		// kill's is 137. Neither counts as unexpected; a crash's exit
-		// before the stop's signal does.
-		if f.Kind == "stop" && catchesTerm(c) {
-			signaled.Store(c.ID, true)
-		}
-		if f.Kind == "stop" { // (it counts from the first SIGTERM, which Docker's stop sends at once)
-			start()
+		// takes the stop signal itself (else it's 143, 128+N for another
+		// signal, or 137 after the timeout); a kill's is 137. Neither
+		// counts as unexpected; a crash's exit before the stop's signal
+		// does. The container is frozen from before that's read until
+		// Docker has sent the signal (it reports the kill once it has),
+		// so that an exec in between (an entrypoint exec'ing its server
+		// as the stop comes) can't change what takes it. If it doesn't
+		// freeze, or Docker reports no kill while it's frozen, what was
+		// read may have changed by the signal: then any code after the
+		// signal is the stop's, as in Antithesis.
+		var sent chan bool
+		ended := make(chan struct{})
+		if f.Kind == "stop" {
+			in.r.pausing(c, true) // (see runner.enter)
+			thaw, ok := frozen(c)
+			if code, takes := stopExits(c); takes || !ok {
+				signaled.Store(c.ID, map[bool]string{true: code}[ok])
+			}
+			sent = make(chan bool, 1)
+			go func() {
+				k := ok && awaitKill(c.ID, n, ended)
+				thaw()
+				in.r.pausing(c, false)
+				sent <- k
+			}()
+			start() // (it counts from the first SIGTERM, which Docker's stop sends at once)
 		}
 		err := do(c)
+		if sent != nil {
+			if err != nil { // (no signal coming)
+				close(ended)
+			}
+			if !<-sent {
+				signaled.Store(c.ID, "")
+			}
+		}
 		if exited(err) { // (it exited since current)
 			gone.Store(c.ID, true)
 			err = nil
@@ -877,7 +903,9 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 		err = errors.Join(err, werr)
 	}
 	if f.Kind == "stop" {
-		signaledExits(slices.DeleteFunc(slices.Clone(ok), func(c container) bool { _, s := signaled.Load(c.ID); return !s }), n)
+		codes := map[string]string{}
+		signaled.Range(func(id, code any) bool { codes[id.(string)] = code.(string); return true })
+		signaledExits(slices.DeleteFunc(slices.Clone(ok), func(c container) bool { _, s := codes[c.ID]; return !s }), codes, n)
 	}
 	done := map[string]bool{}
 	for _, c := range ok {

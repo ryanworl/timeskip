@@ -1,0 +1,43 @@
+# expect: 0. A stop that comes as a container's Go program has just
+# started doesn't count its exit: gochain's PID 1 is, every 2 ms or so,
+# a sh that doesn't catch SIGTERM (as PID 1 it ignores it, so a stop
+# then ends in SIGKILL, 137), then gosu, a Go program whose runtime
+# catches SIGTERM as it starts and, as PID 1, exits 2 on it (the signal
+# it raises to die of it is ignored too), until it execs the sh again, as
+# an entrypoint execs gosu and gosu its server, or a Go server (Consul)
+# is stopped before it calls signal.Notify. The container is frozen from
+# before timeskip reads how its process takes the stop signal until
+# Docker has sent it, so the exit 2 counts as the stop's however soon
+# after the exec the stop comes. The driver runs until node faults have
+# started gochain again 12 times (or about 120 s), which some timeline
+# must reach (Sometimes), so that the run isn't one of too few stops.
+# (Seeds whose timelines all draw node faults: see README.md, Mixing.)
+# args: --timelines 4 --seed 14
+volumes: {shared: {}}
+x-timeskip:
+  faults: high_availability
+  fault_gap: 1
+services:
+  gochain:
+    image: tianon/gosu:1.20
+    volumes: [shared:/shared]
+    command: [sh, -c, "echo boot >> /shared/gochain; echo 'sleep 0.002; exec gosu root sh /tmp/b' > /tmp/a; echo 'sleep 0.002; exec sh /tmp/a' > /tmp/b; exec sh /tmp/a"]
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    volumes: [shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/singleton_driver_x <<'X'
+        #!/bin/sh
+        i=0; until [ $$(wc -l < /shared/gochain) -ge 13 ] || [ $$i -ge 600 ]; do sleep 0.2; i=$$((i + 1)); done
+        n=$$(wc -l < /shared/gochain)
+        echo "{\"antithesis_assert\": {\"assert_type\": \"sometimes\", \"display_type\": \"Sometimes\", \"message\": \"node faults start gochain again 12 times\", \"condition\": $$([ $$n -ge 13 ] && echo true || echo false), \"hit\": true, \"must_hit\": true}}" >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        X
+        chmod +x $$d/singleton_driver_x
+        until [ -s /shared/gochain ]; do sleep 0.2; done
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
