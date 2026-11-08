@@ -94,7 +94,7 @@ func properties(runs []run) []*property {
 	// one timeline and not another.)
 	done := map[string]bool{}
 	for _, r := range runs {
-		if r.Template != "" && !r.setup {
+		if r.Template != "" && !r.setup && !r.NotRun {
 			done[r.Template] = done[r.Template] || !r.TimedOut
 		}
 	}
@@ -134,8 +134,13 @@ func properties(runs []run) []*property {
 func report(runs []run, o options) bool {
 	props := properties(runs)
 	ok := true
-	passed := 0
+	passed, notRun := 0, 0
 	for _, r := range runs {
+		if r.NotRun {
+			fmt.Fprintf(os.Stderr, "timeline %s#%d seed=%d not run (--max-failures)\n", r.Template, r.i, r.Seed)
+			notRun++
+			continue
+		}
 		status := "ok"
 		if !r.Pass {
 			status, ok = "FAIL", false
@@ -214,7 +219,11 @@ func report(runs []run, o options) bool {
 		check(os.MkdirAll(o.out, 0o755))
 		write(filepath.Join(o.out, "results.json"), string(b)+"\n")
 	}
-	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed, %d of %d properties failed\n", passed, len(runs), failed, len(props))
+	stopped := ""
+	if notRun > 0 {
+		stopped = fmt.Sprintf(", %d not run", notRun)
+	}
+	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed%s, %d of %d properties failed\n", passed, len(runs), stopped, failed, len(props))
 	return ok
 }
 
@@ -256,6 +265,9 @@ func profiles(runs []run, dir string) {
 	check(os.MkdirAll(dir, 0o755))
 	self := map[string]int64{}
 	for i, r := range runs {
+		if r.NotRun {
+			continue
+		}
 		var b strings.Builder
 		for _, s := range slices.Sorted(maps.Keys(r.Profile)) {
 			fmt.Fprintf(&b, "%s %d\n", s, r.Profile[s])

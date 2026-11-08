@@ -1,0 +1,22 @@
+# expect: 1. --max-failures (see TestProtocol). In template c, the seed
+# picks first_fail, which exits 1, or first_spin, which computes until the
+# timeout: once a first_fail fails, the run stops the first_spin running
+# alongside, which shows as not run. In template b, the driver fails.
+# args: --template c --timelines 2 -j 2 --max-failures first:1
+x-timeskip:
+  faults: none
+  timeout: 120
+services:
+  workload:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1 && mkdir -p $$d/b $$d/c
+        printf '#!/bin/sh\nexit 1\n' > $$d/b/singleton_driver_fail
+        printf '#!/bin/sh\nexit 1\n' > $$d/c/first_fail
+        printf '#!/bin/sh\nwhile :; do :; done\n' > $$d/c/first_spin
+        chmod +x $$d/b/* $$d/c/*
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647

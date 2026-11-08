@@ -44,7 +44,7 @@ cd ~/.local/share/timeskip
     memory: 4                   # VM memory, GiB
   ```
 
-Useful flags: `--timelines N`, `--seed N`, `--template NAME`, `-j N` (VMs at once; default one per core), `--no-skip` (real time), `--out DIR` (writes `results.json`), `--explore` (branch timelines from new behavior), `--profile`. `timeskip bundle -o app.tsb` writes a bundle that runs elsewhere with `timeskip test app.tsb`.
+Useful flags: `--timelines N`, `--seed N`, `--template NAME`, `-j N` (VMs at once; default one per core), `--no-skip` (real time), `--out DIR` (writes `results.json`), `--explore` (branch timelines from new behavior), `--max-failures N` (stop once N timelines failed; `first:N`, in their `first_` command), `--profile`. `timeskip bundle -o app.tsb` writes a bundle that runs elsewhere with `timeskip test app.tsb`.
 
 ## Results
 

@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand/v2"
@@ -30,7 +31,8 @@ import (
 const usage = `usage:
   timeskip test [compose.yaml|app.tsb] [--template NAME]... [--timelines N] [-j N]
                 [--seed N] [--set KEY=VALUE]... [--out DIR] [--profile]
-                [--explore] [--branch DIR] [--no-build] [--no-skip]
+                [--explore] [--branch DIR] [--max-failures [first:]N]
+                [--no-build] [--no-skip]
       Run the project's test templates (/opt/antithesis/test/v1/NAME/ in its
       containers): N timelines of each (default 1), up to -j at a time
       (default: one per CPU core, the most for all runs on the host), each
@@ -54,7 +56,10 @@ const usage = `usage:
       stacks sampled every 10 ms of CPU time (profiles/TEMPLATE-SEED.folded).
       --explore branches timelines from moments that reached new edges or
       assertion states; --branch replays one, kept when a timeline from it
-      failed. --no-skip runs in real time.
+      failed. --max-failures N stops the run once N timelines failed
+      (first:N, once N failed in their first_ command or before it): no
+      more start, those running stop, and the report shows them as not
+      run. --no-skip runs in real time.
   timeskip bundle [compose.yaml] [--no-build] [--arch arm64|amd64] -o app.tsb
       Pack the project's images and compose file into a bundle (needs Docker).
   timeskip version
@@ -212,6 +217,15 @@ func main() {
 		fs.BoolVar(&o.profile, "profile", false, "")
 		fs.BoolVar(&o.explore, "explore", false, "")
 		fs.StringVar(&o.branch, "branch", "", "")
+		fs.Func("max-failures", "", func(v string) error {
+			n, first := strings.CutPrefix(v, "first:")
+			i, err := strconv.Atoi(n)
+			if err != nil || i < 1 {
+				return errors.New("want N or first:N, N at least 1")
+			}
+			o.maxFailures, o.firstFailures = i, first
+			return nil
+		})
 		pos := parse(fs, args, -1)
 		if len(pos) > 1 {
 			fs.Usage()

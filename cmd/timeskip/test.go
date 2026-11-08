@@ -33,6 +33,8 @@ type options struct {
 	profile                  bool
 	explore                  bool   // branch timelines from moments that did something new (see explore.go)
 	branch                   string // a branch point's checkpoint to run the timelines from (a replay)
+	maxFailures              int    // stop the run once this many timelines failed (0: never)
+	firstFailures            bool   // ... counting only those that failed in their first_ command or before it
 }
 
 // A plan is a timeline to run.
@@ -51,6 +53,7 @@ type run struct {
 	Seed     uint64     `json:"seed"`
 	First    string     `json:"first,omitempty"`
 	Pass     bool       `json:"pass"`
+	NotRun   bool       `json:"not_run,omitempty"` // the run stopped (--max-failures) before it started or ended: it has no result
 	Wall     float64    `json:"wall_s"`
 	From     string     `json:"from"` // the checkpoint it started from: setup, first or branch
 	Branch   *branchRef `json:"branch,omitempty"`
@@ -135,6 +138,9 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	jobs := make(chan struct{}, o.jobs)
+	// (--max-failures: once enough timelines failed, the others don't
+	// start, and those running stop: see vm.next.)
+	enough, failures := make(chan struct{}), 0
 	var x *explorer
 	if o.explore && replay == nil {
 		x = newExplorer(o)
@@ -143,11 +149,26 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 		wg.Go(func() {
 			jobs <- struct{}{}
 			defer func() { <-jobs }()
+			notRun := func() { results[i] = run{Template: p.tmpl, Seed: p.seed, First: p.first, NotRun: true, i: p.i} }
+			select {
+			case <-enough:
+				notRun()
+				return
+			default:
+			}
 			if x != nil {
 				p.from = x.start(p.tmpl)
 			}
 			for {
-				r, newCat := timeline(setup, p, in, o, x, runs, len(plans) == 1)
+				r, newCat := timeline(setup, p, in, o, x, runs, len(plans) == 1, enough)
+				if r.NotRun {
+					if x != nil && p.from != nil {
+						x.done(p.from, false)
+					}
+					os.RemoveAll(filepath.Dir(r.Log))
+					notRun()
+					return
+				}
 				if newCat == nil {
 					if x != nil && p.from != nil {
 						x.done(p.from, !r.Pass)
@@ -158,6 +179,13 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 					if r.Pass || len(plans) == 1 {
 						r.Log = ""
 					}
+					mu.Lock()
+					if o.maxFailures > 0 && countsAsFailure(r, o) {
+						if failures++; failures == o.maxFailures {
+							close(enough)
+						}
+					}
+					mu.Unlock()
 					results[i] = r
 					return
 				}
@@ -191,18 +219,28 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 	}
 	trim()
 	if !ok {
-		if !slices.ContainsFunc(results, func(r run) bool { return !r.setup }) {
+		if !slices.ContainsFunc(results, func(r run) bool { return !r.setup && !r.NotRun }) {
 			exit(125)
 		}
 		exit(1)
 	}
 }
 
+// countsAsFailure is whether r counts toward --max-failures: it failed, and
+// with first:N, in its first_ command or before it (its edits or new images
+// couldn't be applied).
+func countsAsFailure(r run, o options) bool {
+	return !r.Pass && (!o.firstFailures || r.setup || slices.ContainsFunc(r.Commands, func(c protocol.Record) bool {
+		return c.Name == r.First && c.Exit != 0 && !c.Killed
+	}))
+}
+
 // timeline runs one timeline from setup, or from the checkpoint after its
 // first_ command (it saves that checkpoint on the way if no one has), or
 // from p's branch point. Exploring, x saves branch points from it. A new
 // catalog comes back if the edits changed the template's first_ commands.
-func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, runs string, echo bool) (run, protocol.Catalog) {
+// Once enough is closed, it stops the VM, with a result that's NotRun.
+func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, runs string, echo bool, enough chan struct{}) (run, protocol.Catalog) {
 	dir := filepath.Join(runs, fmt.Sprintf("%s-%d", p.tmpl, p.i))
 	os.RemoveAll(dir)
 	from, saveAs, saveLock := setup, (*checkpoint)(nil), 0
@@ -250,6 +288,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 	}()
 	v := start(dir, setup.meta.Nonce, nil, in.dir, from, data, in.img, saveAs != nil || x != nil)
 	defer v.kill()
+	v.cut = enough
 	if echo {
 		v.echo = os.Stdout
 	}
@@ -278,6 +317,9 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 	for {
 		l := v.next()
 		switch l.verb {
+		case "CUT":
+			r.NotRun = true
+			return r, nil
 		case "EDGES": // (a replay's too, from a branch point saved exploring: x is nil then)
 			var e protocol.Edges
 			json.Unmarshal([]byte(l.body), &e)

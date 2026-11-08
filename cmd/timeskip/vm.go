@@ -35,12 +35,13 @@ type vm struct {
 	logged     chan struct{} // closed once its console was read to the end
 	stop       chan struct{} // closed by kill: no one reads ctl any more
 	echo       io.Writer     // when set, the console is copied there too
+	cut        chan struct{} // when closed, next returns CUT, as the run stops early (--max-failures)
 	client     *http.Client
 	killed     atomic.Bool // by kill
 }
 
 type ctlLine struct {
-	verb string // EXITED when the VMM exited without a guest EXIT line
+	verb string // EXITED when the VMM exited without a guest EXIT line; CUT (see vm.cut)
 	body string
 }
 
@@ -247,7 +248,12 @@ func (v *vm) file(name string) string { return filepath.Join(v.dir, name) }
 // powered off, is a harness error. Once exit began, a VMM that exits was
 // killed for it, and next never returns.
 func (v *vm) next() ctlLine {
-	l := <-v.ctl
+	var l ctlLine
+	select {
+	case l = <-v.ctl:
+	case <-v.cut:
+		return ctlLine{verb: "CUT"}
+	}
 	if l.verb == "EXITED" && stopping() {
 		select {}
 	}

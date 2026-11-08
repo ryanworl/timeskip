@@ -109,6 +109,7 @@ type timeline struct {
 		Checkpoint string
 	}
 	Pass          bool
+	NotRun        bool `json:"not_run"`
 	Errors        []string
 	ContainerLogs string  `json:"container_logs"`
 	GuestMs       float64 `json:"guest_ms"`
@@ -811,6 +812,34 @@ func TestProtocol(t *testing.T) {
 				}
 				if stops == 0 {
 					t.Errorf("no stop faults")
+				}
+			}
+			// maxfailures.yaml: first:1 stops the first_spin once the
+			// first_fail failed; a driver's failure doesn't count toward
+			// first:N; and after N failures no timeline starts.
+			if name == "maxfailures" {
+				outcome := func(r result) (l []string) {
+					for _, tl := range r.Timelines {
+						l = append(l, map[bool]string{true: "pass", false: "fail"}[tl.Pass]+" "+tl.First)
+						if tl.NotRun {
+							l[len(l)-1] = "not run " + tl.First
+						}
+					}
+					slices.Sort(l)
+					return l
+				}
+				if got := outcome(r); !slices.Equal(got, []string{"fail first_fail", "not run first_spin"}) {
+					t.Errorf("--max-failures first:1: timelines %q, want a failed first_fail and a first_spin not run", got)
+				}
+				b := filepath.Join("out", "tests", name+".tsb")
+				for _, c := range []struct {
+					max  string
+					want []string
+				}{{"first:1", []string{"fail ", "fail ", "fail "}}, {"2", []string{"fail ", "fail ", "not run "}}} {
+					rc, r, _ := run(t, "protocol-maxfailures-"+c.max, "test", b, "--template", "b", "--timelines", "3", "-j", "1", "--max-failures", c.max)
+					if got := outcome(r); rc != 1 || !slices.Equal(got, c.want) {
+						t.Errorf("--max-failures %s: exit %d, timelines %q, want 1, %q", c.max, rc, got, c.want)
+					}
 				}
 			}
 			// containerlogs.yaml: the ticker's stderr from setup, before
