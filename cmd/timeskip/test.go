@@ -325,10 +325,11 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 				if news += x.news(e); news > 0 && e.AtMs-lastSave >= spacing {
 					if b := x.reserve(p, setup, e, news); b != nil {
 						t := time.Now()
-						x.save(v, b, data, in.img, base)
+						x.save(v, b, data, in.img, base) // (and sends NOTED)
 						paused += time.Since(t)
 						r.Saves, r.SaveS = r.Saves+1, r.SaveS+time.Since(t).Seconds()
 						news, lastSave, saved = 0, e.AtMs, append(saved, b)
+						continue
 					}
 				}
 			}

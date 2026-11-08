@@ -343,15 +343,18 @@ type memBase struct {
 }
 
 // save saves v as b, a branch point reserve put in the pool, and resumes
-// it. data is its data disk and img its inputs. On Linux the VM goes on
+// it with NOTED. data is its data disk and img its inputs. On Linux the VM goes on
 // once its snapshot has the pages written since its restore or its last
 // save (see vm.save); then in the background, once base is made, b's
 // memory file is made of them over a copy of it, and b can be picked; and
 // b's becomes base. On macOS hvrun saves it all.
 func (x *explorer) save(v *vm, b *branchPoint, data, img string, base *memBase) {
 	v.save(b.dir, data, img, b.placeholder(), !darwin)
+	clone(v.file("console.log"), b.file("console.log")) // (what the guest printed until the save)
+	// (NOTED while it's paused: the guest skips no idle time until it
+	// comes, so its clock would run through the host's work after the save.)
+	v.send("NOTED", "")
 	v.resume()
-	clone(v.file("console.log"), b.file("console.log"))
 	j, _ := json.Marshal(b)
 	write(b.file("branch.json"), string(j))
 	ready := func() {
