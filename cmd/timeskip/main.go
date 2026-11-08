@@ -39,8 +39,9 @@ const usage = `usage:
       from a checkpoint saved once the project wrote setup_complete. A
       compose file (default compose.yaml) is built where it changed (not
       with --no-build: its images as they are, as Antithesis takes them),
-      bundled into the cache, and its develop.watch sync rules applied as
-      docker compose watch would; a bundle runs as it is.
+      bundled into the cache (with Docker stopped, the cached bundle as it
+      is if no image needs building), and its develop.watch sync rules
+      applied as docker compose watch would; a bundle runs as it is.
       The project's x-timeskip block sets how its timelines run, and each
       --set KEY=VALUE overrides one of its keys for this run:
         faults: high_availability (the default), resilient, legacy or none:

@@ -521,6 +521,17 @@ func TestBundles(t *testing.T) {
 		if rc, _, out := run(t, "edits-setting", "test", f); rc != 0 || strings.Contains(out, "setting up") || strings.Contains(out, "saving") {
 			t.Errorf("exit %d, or set up or saved images again for a setting", rc)
 		}
+		// Without Docker's daemon: synced edits run on the bundle as it is,
+		// and an image that needs building fails the run.
+		t.Setenv("DOCKER_HOST", "unix://"+filepath.Join(work, "no-docker.sock"))
+		edit(t, pong, "v2", "v4")
+		if rc, out := timeskip(t, "edits-no-docker", "test", f); rc != 0 || !strings.Contains(out, "pong 1 v4") || !strings.Contains(out, "daemon isn't reachable") {
+			t.Errorf("exit %d; want 0, the synced pong.sh's answers and a note", rc)
+		}
+		edit(t, filepath.Join(dir, "pong", "Dockerfile"), "RUN echo v3", "RUN echo v5")
+		if rc, out := timeskip(t, "edits-no-docker-build", "test", f); rc != 2 || !strings.Contains(out, "needs building") {
+			t.Errorf("exit %d; want 2 and that pong needs building", rc)
+		}
 	})
 	t.Run("a template that edits add", func(t *testing.T) {
 		f := project(t, "added")

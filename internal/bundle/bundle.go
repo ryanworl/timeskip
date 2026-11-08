@@ -104,7 +104,10 @@ type Options struct {
 	// were built (recorded in out.inputs, with what their sync rules' paths
 	// held then, and their files' digests in out.sums), and leaves out of
 	// images.tar the images the project doesn't build (listed in the
-	// pulled file instead), for a VM that has them already.
+	// pulled file instead), for a VM that has them already. If Docker's
+	// daemon can't be reached, out is used as it is if that needs nothing
+	// from Docker: no image to build (each one's recorded inputs unchanged,
+	// and out holding the image recorded with them) and nothing else changed.
 	Cache bool
 	// Synced packs what each sync rule's path holds, so that the bundle
 	// tested elsewhere gets the files a test here would sync.
@@ -253,11 +256,28 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		Synced        map[int][]string
 	}
 	state, sums := map[string]record{}, fileSums{map[string]string{}, map[string]string{}}
+	// down is why Docker's daemon can't be reached, if it can't; then had
+	// is out's images, each name's line in its images file, which it must
+	// already hold (see Options.Cache).
+	var down error
+	had := map[string]string{}
 	if o.Cache {
 		b, _ := os.ReadFile(out + ".inputs")
 		json.Unmarshal(b, &state)
 		b, _ = os.ReadFile(out + ".sums")
 		json.Unmarshal(b, &sums.was)
+		if _, err := output("docker", "version", "--format", "{{.Server.Version}}"); err != nil {
+			e := strings.TrimSpace(err.Error())
+			down = errors.New(e[strings.LastIndexByte(e, '\n')+1:])
+			for _, l := range strings.Split(Files(out)["images"], "\n") {
+				if img, id, ok := strings.Cut(l, " "); ok {
+					had[img] = id
+				}
+			}
+		}
+	}
+	needsDocker := func(why string) error {
+		return fmt.Errorf("%s, and Docker's daemon isn't reachable (%v): start Docker", why, down)
 	}
 	for _, name := range names {
 		s, b := p.Services[name], specs[name]
@@ -269,9 +289,19 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 			if in, err = buildInputs(name, s, b, syncs, &sums); err != nil {
 				return nil, fmt.Errorf("service %s: %v", name, err)
 			}
-			if r := state[name]; r.Inputs == in && r.Image == imageID(s.Image, plats[s.Image]) {
+			// (Without Docker, the image built from these inputs is the one
+			// out holds, recorded when it was built, which build checked
+			// reached Docker's images.)
+			r := state[name]
+			if r.Inputs == in && down != nil && r.Image != "" && r.Image == had[s.Image] {
 				continue
 			}
+			if r.Inputs == in && down == nil && r.Image == imageID(s.Image, plats[s.Image]) {
+				continue
+			}
+		}
+		if down != nil {
+			return nil, needsDocker(fmt.Sprintf("%s needs building (its build inputs changed, or the cached bundle doesn't hold the image built from them)", s.Image))
 		}
 		if err := build(s.Image, *b, plats[s.Image], log); err != nil {
 			return nil, fmt.Errorf("building %s: %v", s.Image, err)
@@ -328,6 +358,14 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 	var ids []string
 	tags := map[string][]string{} // the names images.tar gives images by digest (see normalizeSave)
 	for _, img := range images {
+		if down != nil { // (as out has it, pulled or built)
+			id, ok := had[img]
+			if !ok {
+				return nil, needsDocker("the cached bundle doesn't hold " + img)
+			}
+			ids = append(ids, img+" "+id)
+			continue
+		}
 		if !built[img] {
 			err := pull(img, plats[img], policies[img], log)
 			if err != nil && arch == "arm64" && !explicit[img] && noPlatform(err) {
@@ -418,7 +456,13 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 	}
 	if maps.Equal(Files(out), files) {
 		fmt.Fprintf(log, "%s is up to date\n", out)
+		if down != nil {
+			fmt.Fprintf(log, "note: Docker's daemon isn't reachable: the bundle's images are those built from their unchanged build inputs, and the others as they were pulled then\n")
+		}
 		return syncs, nil
+	}
+	if down != nil {
+		return nil, needsDocker("the cached bundle would change (the project changed)")
 	}
 	fmt.Fprintf(log, "saving %d images:\n  %s\n", len(saved), strings.Join(saved, "\n  "))
 	groups := map[string][]string{plat: nil} // (images.tar, if empty)
