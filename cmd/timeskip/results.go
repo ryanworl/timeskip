@@ -215,9 +215,9 @@ func printTimeline(r run, status string, o options, count string) {
 			faults += " (no node faults)"
 		}
 	}
-	from := r.From
+	from := "setup"
 	if r.Branch != nil {
-		from += ": " + r.Branch.String()
+		from = "branch: " + r.Branch.String()
 	}
 	fmt.Fprintf(os.Stderr, "timeline %s#%d seed=%d %-4s %d commands%s, %.1f s of guest time in %.2f s (from %s)%s\n",
 		r.Template, r.i, r.Seed, status, len(r.Commands), faults, float64(r.GuestMs)/1000, r.Wall, from, count)

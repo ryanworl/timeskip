@@ -20,9 +20,8 @@ import (
 // checkpoint, saved once dockerd is up in a VM booted for the kit; a
 // bundle's setup checkpoint, restored from the base (or from an images
 // checkpoint, a bundle's of images only) and saved once the project wrote
-// setup_complete and went idle; or one saved after a
-// template's first_ command, in a directory inside its setup checkpoint's.
-// Its directory holds state and its memory (mem; on macOS, hvrun's
+// setup_complete and went idle (or a branch point: see explore.go). Its
+// directory holds state and its memory (mem; on macOS, hvrun's
 // state.mem), disk (its data disk), meta.json and done (once it's
 // complete, and synced). A base or setup checkpoint also
 // holds bundle.tsb (the bundle's drive: a link to the bundle, or the base's
@@ -250,8 +249,7 @@ var keepLast = map[string]int{"logs": 10, "branches": 3}
 func trim() {
 	old := func(p string) bool { fi, err := os.Stat(p); return err == nil && time.Since(fi.ModTime()) > unused }
 	locks, _ := filepath.Glob(filepath.Join(cache, "checkpoints", "*.lock"))
-	firsts, _ := filepath.Glob(filepath.Join(cache, "checkpoints", "*", "first-*.lock"))
-	for _, l := range append(firsts, locks...) {
+	for _, l := range locks {
 		// (Unused, or never finished: a run killed while it made it.)
 		if c := strings.TrimSuffix(l, ".lock"); old(l) || !exists(filepath.Join(c, "done")) {
 			remove(c)

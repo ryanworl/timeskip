@@ -22,7 +22,7 @@ import (
 // the edges it reaches to libvoidstar (guest/libvoidstar.c), which sets
 // their bits in a file per module in covDir, shared by every container
 // (covInCtr). The files are in the checkpoints too, so a timeline starts
-// with what setup (and its first_ command) reached.
+// with what setup reached.
 const (
 	covDir   = "/run/timeskip-coverage"
 	covInCtr = "/timeskip-coverage"

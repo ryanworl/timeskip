@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/ryanworl/timeskip/internal/protocol"
@@ -55,7 +54,6 @@ type run struct {
 	Pass     bool       `json:"pass"`
 	NotRun   bool       `json:"not_run,omitempty"` // the run stopped (--max-failures) before it started or ended: it has no result
 	Wall     float64    `json:"wall_s"`
-	From     string     `json:"from"` // the checkpoint it started from: setup, first or branch
 	Branch   *branchRef `json:"branch,omitempty"`
 	Saves    int        `json:"saves,omitempty"`  // branch points saved from it (exploring)
 	SaveS    float64    `json:"save_s,omitempty"` // ... and the wall time it was paused for them
@@ -247,75 +245,36 @@ func countsAsFailure(r run, o options) bool {
 	}))
 }
 
-// timeline runs one timeline from setup, or from the checkpoint after its
-// first_ command (it saves that checkpoint on the way if no one has), or
-// from p's branch point. Exploring, x saves branch points from it. A new
-// catalog comes back if the edits changed the template's first_ commands.
-// Once enough is closed, it stops the VM, with a result that's NotRun.
+// timeline runs one timeline from setup, or from p's branch point.
+// Exploring, x saves branch points from it. A new catalog comes back if the
+// edits changed the template's first_ commands. Once enough is closed, it
+// stops the VM, with a result that's NotRun.
 func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, runs string, echo bool, enough chan struct{}) (run, protocol.Catalog) {
 	dir := filepath.Join(runs, fmt.Sprintf("%s-%d", p.tmpl, p.i))
 	os.RemoveAll(dir)
-	from, saveAs, saveLock := setup, (*checkpoint)(nil), 0
-	pre, digest := in.pre(p.tmpl)
+	from := setup
 	if p.from != nil {
 		from, p.first, p.firsts = p.from.checkpoint, p.from.First, p.from.Firsts
-	} else if p.first != "" {
-		// (Timelines from it share its lock; saving or removing it takes it
-		// exclusively. A new version of the first_ and helper_ files
-		// replaces the one before, as a new version of a bundle replaces
-		// its checkpoint.)
-		name := filepath.Join(setup.dir, "first-"+hash(p.tmpl, p.first, p.firsts))
-		k := &checkpoint{dir: name + "-" + hash(digest), setup: setup.dir}
-		if l, ok := tryLock(k.dir+".lock", syscall.LOCK_SH); ok {
-			defer syscall.Close(l)
-			switch {
-			case k.done():
-				from = k
-				used(k.dir + ".lock")
-			case syscall.Flock(l, syscall.LOCK_EX|syscall.LOCK_NB) == nil:
-				os.RemoveAll(k.dir)
-				check(os.MkdirAll(k.dir, 0o755))
-				saveAs, saveLock = k, l
-				others, _ := filepath.Glob(name + "-*.lock")
-				for _, o := range others {
-					if o != k.dir+".lock" {
-						remove(strings.TrimSuffix(o, ".lock"))
-					}
-				}
-			}
-		}
 	}
 	check(os.MkdirAll(dir, 0o755))
 	data := filepath.Join(dir, "disk")
 	clone(from.file("disk"), data)
 	defer os.Remove(data) // (once the VM is gone: a run may have thousands)
-	// (On Linux the first_ checkpoint's save writes the pages written since
-	// the restore over a copy of the memory file, made meanwhile.)
-	copied := make(chan struct{})
-	go func() {
-		if saveAs != nil && !darwin {
-			clone(from.file("mem"), saveAs.file("mem"))
-		}
-		close(copied)
-	}()
-	v := start(dir, setup.meta.Nonce, nil, in.dir, from, data, in.img, saveAs != nil || x != nil)
+	v := start(dir, setup.meta.Nonce, nil, in.dir, from, data, in.img, x != nil)
 	defer v.kill()
 	v.cut = enough
 	if echo {
 		v.echo = os.Stdout
 	}
-	r := run{Template: p.tmpl, Seed: p.seed, First: p.first, From: "setup", Log: v.file("console.log"), i: p.i}
+	r := run{Template: p.tmpl, Seed: p.seed, First: p.first, Log: v.file("console.log"), i: p.i}
 	t0, paused := time.Now(), time.Duration(0)
 	if p.from != nil {
 		ref := *p.from.Ref
-		r.From, r.Branch, r.from = "branch", &ref, p.from
+		r.Branch, r.from = &ref, p.from
 		v.send("BRANCH", fmt.Sprintf("seed=%d", p.seed))
 	} else {
-		if from != setup {
-			r.From = "first"
-		}
 		v.send("GO", protocol.Go{Skip: o.skip, Seed: p.seed, Template: p.tmpl, First: p.first, Firsts: p.firsts, Drivers: o.drivers,
-			Timeout: o.timeout, Pre: pre, Checkpoint: saveAs != nil, Inputs: in.spec,
+			Timeout: o.timeout, Inputs: in.spec,
 			Faults: map[bool]float64{true: o.faultGap}[o.faults != ""], Level: o.faults, Disk: o.diskFaults, Profile: o.profile,
 			Symbols: wantSymbols.Load(), Explore: x != nil}.String())
 	}
@@ -347,22 +306,6 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 				}
 			}
 			v.send("NOTED", "")
-			continue
-		case "CHECKPOINT":
-			t := time.Now()
-			<-copied
-			v.save(saveAs.dir, data, in.img, setup.placeholder(), false)
-			base.file = saveAs.file("mem")
-			published := make(chan struct{})
-			go func() {
-				saveAs.publish()
-				syscall.Flock(saveLock, syscall.LOCK_SH) // (others may start from it now)
-				close(published)
-			}()
-			defer func() { <-published }() // (before its lock goes)
-			v.resume()
-			v.send("CONTINUE", "")
-			paused += time.Since(t)
 			continue
 		case "EXIT":
 			e := exitOf(l)

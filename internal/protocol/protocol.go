@@ -1,8 +1,8 @@
 // Package protocol is the control channel between the CLI (cmd/timeskip)
 // and the guest agent (cmd/guest), as docs/reference.md describes it: lines on the
 // VM's console of the form "TS <nonce> VERB BODY". The host's verbs (SETUP,
-// GO, CONTINUE, NOTED, BRANCH, LOGS) have key=value fields; the guest's (BASE,
-// READY, CHECKPOINT, EDGES, EXIT, LOGGED) a JSON body.
+// GO, NOTED, BRANCH, LOGS) have key=value fields; the guest's (BASE, READY,
+// EDGES, EXIT, LOGGED) a JSON body.
 package protocol
 
 import (
@@ -57,19 +57,12 @@ type Go struct {
 	Firsts   []string // the template's first_ commands, as the host found them
 	Drivers  int      // driver commands to launch, when not a singleton_driver
 	Timeout  int      // guest seconds before the timeline is stopped
-	// Pre are the edits to apply before First, by name: the ones touching
-	// or deleting first_ and helper_ files.
-	Pre []string
-	// Checkpoint: after First, go idle and send CHECKPOINT, for the host to
-	// save the VM, then wait. CONTINUE goes on; a GO comes to a VM restored
-	// from that checkpoint, which goes on with that GO's seed and inputs.
-	Checkpoint bool
-	Inputs     string   // where the edits are: none, virtiofs or blk:SIZE (the third drive)
-	Faults     float64  // inject faults while the drivers run, at most a gap apart that each timeline draws around Faults seconds (see the guest's inject); 0: none
-	Level      string   // which faults, by Antithesis's fault tolerance level: legacy, resilient or high_availability
-	Disk       []string // with Faults, disk faults too, of these kinds (fail, full, power), which no fault tolerance level makes
-	Profile    bool     // sample the containers' stacks as they use the CPU
-	Symbols    bool     // send the instrumented modules' symbol tables
+	Inputs   string   // where the edits are: none, virtiofs or blk:SIZE (the third drive)
+	Faults   float64  // inject faults while the drivers run, at most a gap apart that each timeline draws around Faults seconds (see the guest's inject); 0: none
+	Level    string   // which faults, by Antithesis's fault tolerance level: legacy, resilient or high_availability
+	Disk     []string // with Faults, disk faults too, of these kinds (fail, full, power), which no fault tolerance level makes
+	Profile  bool     // sample the containers' stacks as they use the CPU
+	Symbols  bool     // send the instrumented modules' symbol tables
 	// Explore: send EDGES as the drivers run, when instrumented code
 	// reaches edges new to the VM or SDK assertions reach new states, and
 	// take BRANCH.
@@ -77,16 +70,16 @@ type Go struct {
 }
 
 func (g Go) String() string {
-	return fmt.Sprintf("skip=%d seed=%d template=%s first=%s firsts=%s drivers=%d timeout=%d pre=%s checkpoint=%d inputs=%s faults=%g level=%s disk=%s profile=%d symbols=%d explore=%d",
+	return fmt.Sprintf("skip=%d seed=%d template=%s first=%s firsts=%s drivers=%d timeout=%d inputs=%s faults=%g level=%s disk=%s profile=%d symbols=%d explore=%d",
 		bit(g.Skip), g.Seed, url.QueryEscape(g.Template), url.QueryEscape(g.First), list(g.Firsts), g.Drivers, g.Timeout,
-		list(g.Pre), bit(g.Checkpoint), g.Inputs, g.Faults, g.Level, list(g.Disk), bit(g.Profile), bit(g.Symbols), bit(g.Explore))
+		g.Inputs, g.Faults, g.Level, list(g.Disk), bit(g.Profile), bit(g.Symbols), bit(g.Explore))
 }
 
 // ParseGo is the Go in a GO line's body.
 func ParseGo(body string) Go {
 	kv := Fields(body)
 	g := Go{Skip: kv["skip"] == "1", Template: unescape(kv["template"]), First: unescape(kv["first"]), Firsts: unlist(kv["firsts"]),
-		Pre: unlist(kv["pre"]), Checkpoint: kv["checkpoint"] == "1", Inputs: kv["inputs"], Level: kv["level"], Disk: unlist(kv["disk"]), Profile: kv["profile"] == "1", Symbols: kv["symbols"] == "1", Explore: kv["explore"] == "1"}
+		Inputs: kv["inputs"], Level: kv["level"], Disk: unlist(kv["disk"]), Profile: kv["profile"] == "1", Symbols: kv["symbols"] == "1", Explore: kv["explore"] == "1"}
 	g.Seed, _ = strconv.ParseUint(kv["seed"], 10, 64)
 	g.Drivers, _ = strconv.Atoi(kv["drivers"])
 	g.Timeout, _ = strconv.Atoi(kv["timeout"])

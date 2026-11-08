@@ -106,9 +106,9 @@ type waker struct {
 }
 
 type timeline struct {
-	Template, First, From string
-	Seed                  uint64
-	Branch                *struct {
+	Template, First string
+	Seed            uint64
+	Branch          *struct {
 		Seed       uint64
 		AtMs       int64 `json:"at_ms"`
 		Checkpoint string
@@ -221,7 +221,7 @@ func TestDemo(t *testing.T) {
 			}
 		}
 	})
-	t.Run("parallel timelines from the first_ checkpoint", func(t *testing.T) {
+	t.Run("parallel timelines", func(t *testing.T) {
 		rc, r, _ := run(t, "demo-6", "test", demo, "--timelines", "6", "-j", "6")
 		if rc != 0 || len(r.Timelines) != 6 {
 			t.Fatalf("exit %d, %d timelines", rc, len(r.Timelines))
@@ -229,8 +229,8 @@ func TestDemo(t *testing.T) {
 		seeds := map[uint64]bool{}
 		for _, tl := range r.Timelines {
 			seeds[tl.Seed] = true
-			if tl.From != "first" || !tl.Pass {
-				t.Errorf("timeline seed=%d from %s, pass %v", tl.Seed, tl.From, tl.Pass)
+			if !tl.Pass {
+				t.Errorf("timeline seed=%d failed", tl.Seed)
 			}
 		}
 		if len(seeds) != 6 {
@@ -492,26 +492,12 @@ func TestBundles(t *testing.T) {
 		edit(t, filepath.Join(dir, "workload", "test", "parallel_driver_ping.sh"), "for n in", `echo "edited driver"; for n in`)
 		os.Remove(filepath.Join(dir, "workload", "test", "finally_tally.sh"))
 		r = step("sync", "edited driver")
-		if slices.Contains(r.commands(0), "finally_tally.sh") || r.Timelines[0].From != "first" {
-			t.Errorf("ran %v from %s; want no finally_ command, from the first_ checkpoint", r.commands(0), r.Timelines[0].From)
+		if slices.Contains(r.commands(0), "finally_tally.sh") {
+			t.Errorf("ran %v; want no finally_ command", r.commands(0))
 		}
-		// An edit to the first_ command makes a new first_ checkpoint.
+		// An edit to the first_ command.
 		edit(t, filepath.Join(dir, "workload", "test", "first_handshake.sh"), "r=$(", `echo "edited first"; r=$(`)
-		if r = step("first_", "edited first"); r.Timelines[0].From != "setup" {
-			t.Errorf("from %s, want setup", r.Timelines[0].From)
-		}
-		if r = step("first_ again"); r.Timelines[0].From != "first" {
-			t.Errorf("from %s, want first", r.Timelines[0].From)
-		}
-		// ... which took the place of the one before.
-		ms, _ := filepath.Glob(filepath.Join(work, "cache", "checkpoints", "*", "meta.json"))
-		for _, m := range ms {
-			if raw, _ := os.ReadFile(m); strings.Contains(string(raw), fmt.Sprintf("%x", sha256.Sum256([]byte(f)))[:16]+".tsb") {
-				if firsts, _ := filepath.Glob(filepath.Join(filepath.Dir(m), "first-*", "done")); len(firsts) != 1 {
-					t.Errorf("%d first_ checkpoints, want 1: %v", len(firsts), firsts)
-				}
-			}
-		}
+		step("first_", "edited first")
 		// A new image: the project is set up again with it, from the
 		// checkpoint with the images it doesn't build; then not again.
 		edit(t, filepath.Join(dir, "pong", "Dockerfile"), "COPY pong.sh", "RUN echo v3 > /version\nCOPY pong.sh")
@@ -640,11 +626,11 @@ func TestBundles(t *testing.T) {
 		}
 		var branched []timeline
 		for _, tl := range r.Timelines {
-			if tl.From != "branch" {
+			if tl.Branch == nil {
 				continue
 			}
 			branched = append(branched, tl)
-			if p, ok := seeds[tl.Branch.Seed]; !ok || p.From != "setup" || tl.Branch.AtMs <= 0 || drawn(tl, "before") != drawn(p, "before") {
+			if p, ok := seeds[tl.Branch.Seed]; !ok || p.Branch != nil || tl.Branch.AtMs <= 0 || drawn(tl, "before") != drawn(p, "before") {
 				t.Errorf("timeline %d branched from %+v, which drew %q before; it drew %q", tl.Seed, tl.Branch, drawn(p, "before"), drawn(tl, "before"))
 			}
 		}
@@ -676,7 +662,7 @@ func TestBundles(t *testing.T) {
 		lo, hi, n := math.Inf(1), math.Inf(-1), 0
 		for _, tl := range r.Timelines {
 			for _, a := range tl.Assertions {
-				if up, ok := strings.CutPrefix(a.Message, "ending at "); ok && tl.From == "branch" {
+				if up, ok := strings.CutPrefix(a.Message, "ending at "); ok && tl.Branch != nil {
 					x, _ := strconv.ParseFloat(up, 64)
 					lo, hi, n = min(lo, x), max(hi, x), n+1
 				}
@@ -688,7 +674,7 @@ func TestBundles(t *testing.T) {
 		// A timeline never waits for a branch point: with 4 at once, none
 		// is saved yet as they start, so all 4 start from setup.
 		rc, r, _ = run(t, "sdk-nowait", "test", f, "--template", "explore", "--explore", "--timelines", "4", "-j", "4", "--set", "drivers=1")
-		if n := slices.IndexFunc(r.Timelines, func(tl timeline) bool { return tl.From != "setup" }); rc != 1 || len(r.Timelines) != 4 || n >= 0 {
+		if n := slices.IndexFunc(r.Timelines, func(tl timeline) bool { return tl.Branch != nil }); rc != 1 || len(r.Timelines) != 4 || n >= 0 {
 			t.Errorf("4 timelines at once: exit %d, %d timelines, one (%d) not from setup; want 1, 4, all from setup", rc, len(r.Timelines), n)
 		}
 		// (A failed timeline's branch point is kept: a replay draws the same.)
@@ -697,8 +683,8 @@ func TestBundles(t *testing.T) {
 		if rc != 1 || len(rb.Timelines) != 1 {
 			t.Fatalf("a replay from %s: exit %d, %d timelines", b.Branch.Checkpoint, rc, len(rb.Timelines))
 		}
-		if tl := rb.Timelines[0]; tl.From != "branch" || drawn(tl, "after") != drawn(b, "after") {
-			t.Errorf("a replay from %s (from %s) drew %q after the edge, want %q", b.Branch.Checkpoint, tl.From, drawn(tl, "after"), drawn(b, "after"))
+		if tl := rb.Timelines[0]; tl.Branch == nil || drawn(tl, "after") != drawn(b, "after") {
+			t.Errorf("a replay from %s (branched: %v) drew %q after the edge, want %q", b.Branch.Checkpoint, tl.Branch != nil, drawn(tl, "after"), drawn(b, "after"))
 		}
 	})
 	// The examples as they ship pass under the default faults (as README's
@@ -720,34 +706,38 @@ func TestBundles(t *testing.T) {
 . "$(dirname "$0")/helper_assert.sh"
 assert sometimes "uuid $(cat /proc/sys/kernel/random/uuid)" true
 `), 0o755)
+		// (The first_ command's too, as in Antithesis.)
+		os.WriteFile(filepath.Join(test, "first_handshake.sh"), []byte(`#!/bin/sh
+. "$(dirname "$0")/helper_assert.sh"
+assert sometimes "first uuid $(cat /proc/sys/kernel/random/uuid)" true
+`), 0o755)
 		os.Remove(filepath.Join(test, "anytime_reachable.sh")) // (whose processes would race it for random numbers)
 		rc, r, _ := run(t, "random", "test", f, "--timelines", "4", "--set", "drivers=1")
 		if rc != 0 {
 			t.Fatalf("exit %d", rc)
 		}
-		n := 0
-		for _, p := range r.Properties {
-			if strings.HasPrefix(p.Name, "uuid ") {
-				n++
-			}
-		}
-		if n != 4 {
-			t.Errorf("%d different uuids in 4 timelines", n)
-		}
-		// A replay of the timeline that ran the first_ command and saved its
-		// checkpoint, from that checkpoint, draws the same numbers.
-		uuid := func(r result, i int) string {
+		uuids := func(r result, i int) (l []string) {
 			for _, a := range r.Timelines[i].Assertions {
-				if strings.HasPrefix(a.Message, "uuid ") {
-					return a.Message
+				if strings.Contains(a.Message, "uuid ") {
+					l = append(l, a.Message)
 				}
 			}
-			return ""
+			slices.Sort(l)
+			return l
 		}
-		i := max(0, slices.IndexFunc(r.Timelines, func(tl timeline) bool { return tl.From == "setup" }))
-		_, rr, _ := run(t, "random-replay", "test", f, "--seed", fmt.Sprint(r.Timelines[i].Seed), "--set", "drivers=1")
-		if len(rr.Timelines) != 1 || uuid(rr, 0) != uuid(r, i) {
-			t.Errorf("seed %d (from %s) drew %q, then %q", r.Timelines[i].Seed, r.Timelines[i].From, uuid(r, i), uuid(rr, 0))
+		seen := map[string]bool{}
+		for i := range r.Timelines {
+			for _, u := range uuids(r, i) {
+				seen[u] = true
+			}
+		}
+		if len(seen) != 8 {
+			t.Errorf("%d different uuids in 4 timelines, want 8: %v", len(seen), seen)
+		}
+		// A replay draws the same numbers.
+		_, rr, _ := run(t, "random-replay", "test", f, "--seed", fmt.Sprint(r.Timelines[1].Seed), "--set", "drivers=1")
+		if len(rr.Timelines) != 1 || !slices.Equal(uuids(rr, 0), uuids(r, 1)) {
+			t.Errorf("seed %d drew %q, then %q", r.Timelines[1].Seed, uuids(r, 1), uuids(rr, 0))
 		}
 	})
 }

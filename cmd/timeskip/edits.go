@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -184,40 +183,4 @@ func (s *staged) templates() (l []string) {
 		}
 	}
 	return l
-}
-
-// pre is what of the edits a template's first_ command can see: the edits
-// that touch (or delete) its first_ or helper_ files (their names, to
-// apply before it), and a digest of those files, for its checkpoint's name.
-func (s *staged) pre(tmpl string) (names []string, digest string) {
-	h := sha256.New()
-	dir := "/opt/antithesis/test/v1/" + tmpl + "/"
-	seen := func(p string) bool {
-		rel, ok := strings.CutPrefix(p, dir)
-		return ok && (strings.HasPrefix(rel, "first_") || strings.HasPrefix(rel, "helper_"))
-	}
-	for i, paths := range s.paths {
-		e := s.edits[i]
-		gone := slices.DeleteFunc(slices.Clone(e.deleted), func(p string) bool { return !seen(p) })
-		if !slices.ContainsFunc(paths, seen) && len(gone) == 0 {
-			continue
-		}
-		names = append(names, strconv.Itoa(i))
-		for _, p := range gone {
-			fmt.Fprintln(h, e.service, p, "deleted")
-		}
-		root := filepath.Join(s.dir, strconv.Itoa(i))
-		filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			rel, _ := filepath.Rel(root, p)
-			if err == nil && !d.IsDir() && seen(filepath.Join(e.target, rel)) {
-				fi, _ := d.Info()
-				fmt.Fprintln(h, e.service, filepath.Join(e.target, rel), fi.Mode())
-				f, _ := os.Open(p)
-				io.Copy(h, f)
-				f.Close()
-			}
-			return nil
-		})
-	}
-	return names, fmt.Sprintf("%x", h.Sum(nil))[:16]
 }

@@ -13,7 +13,7 @@ description: "Runs a Docker Compose project's Antithesis-style test templates in
 - **No test templates** is fine: the workload then runs by itself (in the entrypoints) for `timeout` seconds per timeline (see Settings), faults included.
 - **Setup complete**: once the system is ready, some container appends `{"antithesis_setup": {"status": "complete", "details": null}}` to `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl` (or calls an Antithesis SDK's `setup_complete`). Usually the test container's entrypoint does it after polling the services, then stays up (`exec sleep 2147483647`). Everything before it, loading fixture data included, is saved once as the checkpoint every timeline starts from.
 - **Test commands** live in `/opt/antithesis/test/v1/<template>/` in a running container, executable, named by when they run:
-  - `first_*`: setup for the template (one per timeline, before anything else; its result is checkpointed too).
+  - `first_*`: setup for the template (one per timeline, before anything else).
   - `parallel_driver_*`: the workload, run alongside each other; `serial_driver_*`: run alone; `singleton_driver_*`: the only driver of its timeline (a ported integration test).
   - `anytime_*`: invariant checks at random moments.
   - `finally_*`: after every driver finished (checks on the final state); `eventually_*`: after killing whatever runs (checks recovery).
@@ -36,7 +36,6 @@ timeskip test --seed 1234 --template main          # rerun a failing timeline's 
 
 - Every timeline applies the sync rules as `docker compose watch` would after your edits: files that differ from the container's are copied in (Compose's ignore rules, host owners), files deleted on the host since the image was built are deleted, then a changed `sync+restart` rule restarts its service (`sync+exec` rules are refused). A plain `sync` restarts nothing; a test command picks up its new file on its next run. A synced binary runs in a Linux container on the host's architecture (arm64 on a Mac, amd64 on Linux): one for the wrong OS or architecture, or missing its execute bit, fails with exit 125.
 - An image is rebuilt when its build inputs changed. A rebuilt image or a `compose.yaml` change sets the project up again before the timelines run; the images the project pulls stay loaded in a checkpoint of their own. Once a run has bundled and set up the project, later runs that rebuild nothing (only synced files changed) work with Docker stopped, leaving its VM's CPU and memory to timeskip's; so do new setups after a kit update or a new `memory`. One that needs a build, or a changed `compose.yaml`, says to start Docker.
-- Edits to `first_` or `helper_` files rerun the `first_` command and checkpoint it again; other edits start from the existing checkpoint.
 - `--max-failures N` stops a run once N timelines failed, and `--max-failures first:N` once N failed in their `first_` command (or applying the edits): a broken build then costs one timeline, not all of them. The timelines not run show as such.
 - `--no-skip` runs the same timelines in real time, for comparison. `--no-build` takes the images as they are (built some other way), as Antithesis does.
 - `timeskip bundle -o app.tsb` packs what `test` would test, synced files included, for `timeskip test app.tsb` on another machine of the same architecture. The same project gives the same bytes.

@@ -25,52 +25,17 @@ import (
 func timeline(g protocol.Go) {
 	tmpl := g.Template
 	r := newRunner(tmpl)
+	reseed(g.Seed)
 	r.begin(g)
 	mountInputs(g.Inputs)
-	edits := readEdits()
-	var pre []edit
-	for _, e := range edits {
-		if slices.Contains(g.Pre, e.name) {
-			pre = append(pre, e)
-		}
-	}
-	apply(r.ctx, pre)
-	cat, _, err := discover()
+	apply(r.ctx, readEdits())
+	cat, invalid, err := discover()
 	check(err)
 	// (A template the edits add may not be there yet.)
 	if !slices.Equal(cat.firsts(tmpl), g.Firsts) {
 		msg("EXIT", protocol.Exit{Kind: "replan", Catalog: cat.wire()})
 		return
 	}
-	if f := g.First; f != "" {
-		// What the first_ command leaves is checkpointed and shared, so it
-		// runs alike in every timeline (with seed 0's random numbers); after
-		// it every timeline starts again with its own seed, as one restored
-		// from the checkpoint does, so that its replays match it.
-		reseed(0)
-		i := slices.IndexFunc(cat[tmpl], func(c command) bool { return c.Name == f })
-		if rec := r.run(cat[tmpl][i]); rec.Exit != 0 || rec.Killed {
-			r.finish()
-			return
-		}
-		if g.Checkpoint {
-			if g.Skip {
-				idle()
-			}
-			syscall.Unmount("/inputs", 0)
-			freeze(false)
-			msg("CHECKPOINT", struct{}{})
-			if verb, body := await("CONTINUE", "GO"); verb == "GO" {
-				g = protocol.ParseGo(body)
-			}
-			mountInputs(g.Inputs)
-			edits = readEdits()
-		}
-		r.begin(g)
-	}
-	apply(r.ctx, edits)
-	cat, invalid, err := discover()
-	check(err)
 	for _, i := range invalid { // (as Antithesis's "Invalid commands found")
 		r.errors = append(r.errors, "invalid test command: "+i)
 	}
@@ -78,6 +43,14 @@ func timeline(g protocol.Go) {
 		fail("no test template %s: no running container has commands in %s/%s/", tmpl, templates, tmpl)
 	}
 	syscall.Unmount("/inputs", 0) // (applied; and the VM can be saved now)
+	if f := g.First; f != "" {
+		i := slices.IndexFunc(cat[tmpl], func(c command) bool { return c.Name == f })
+		if rec := r.run(cat[tmpl][i]); rec.Exit != 0 || rec.Killed {
+			r.finish()
+			return
+		}
+		r.begin(g)
+	}
 	if g.Explore {
 		watch(r, g)
 	}
@@ -168,16 +141,14 @@ func sleepDrawn(d time.Duration, redraw func() time.Duration, stop <-chan struct
 }
 
 // begin starts (or, after the first_ command, restarts) the timeline's
-// clock: the kernel reseeded with its seed, skipping as asked and its
-// timeout set.
+// clock: skipping as asked and its timeout set.
 func (r *runner) begin(g protocol.Go) {
-	reseed(g.Seed)
 	setSkip(g.Skip)
 	timeout := time.Duration(g.Timeout) * time.Second
 	r.stopWatchdog()
 	r.t0, r.s0, r.cpu0 = uptime(), skips(), cgroupCPU()
 	logsT0 = r.t0
-	if r.prof != nil { // (it profiled the first_ command, before a checkpoint)
+	if r.prof != nil { // (it profiled the first_ command)
 		r.prof.stop()
 		r.prof = nil
 	}

@@ -28,7 +28,7 @@ func TestTrim(t *testing.T) {
 		return p
 	}
 	backdate := func(p string) { os.Chtimes(p, long, long) }
-	for _, d := range []string{"old", "held", "recent", "reused", "recent/first-a", "recent/first-b", "orphan"} {
+	for _, d := range []string{"old", "held", "recent", "reused", "orphan"} {
 		os.MkdirAll(filepath.Join(cache, "checkpoints", d), 0o755)
 		os.WriteFile(filepath.Join(cache, "checkpoints", d, "done"), nil, 0o644)
 	}
@@ -40,8 +40,6 @@ func TestTrim(t *testing.T) {
 	entry("checkpoints/recent.lock")
 	entry("checkpoints/orphan.lock") // (of a bundle that's gone)
 	os.WriteFile(filepath.Join(cache, "checkpoints", "orphan", "meta.json"), fmt.Appendf(nil, `{"bundle": %q}`, filepath.Join(cache, "gone.tsb")), 0o644)
-	backdate(entry("checkpoints/recent/first-a.lock"))
-	entry("checkpoints/recent/first-b.lock")
 	reused := entry("checkpoints/reused.lock")
 	backdate(reused)
 	used(reused)
@@ -96,7 +94,6 @@ func TestTrim(t *testing.T) {
 		"checkpoints/old": false, "checkpoints/old.lock": false,
 		"checkpoints/held": true, "checkpoints/recent": true, "checkpoints/reused": true, "checkpoints/orphan": false,
 		"checkpoints/unfinished": false, "checkpoints/unfinished.lock": false,
-		"checkpoints/recent/first-a": false, "checkpoints/recent/first-b": true,
 		"bundles/p.tsb": false, "bundles/p.tsb.inputs": false, "bundles/p.tsb.sums": false, "bundles/p.tsb.lock": false,
 		"bundles/q.tsb": true, "bundles/gone.tsb": false, "logs/old": false,
 		"logs/102-setup.log": true, "logs/101-setup.log": false, "logs/100-setup.log": false,

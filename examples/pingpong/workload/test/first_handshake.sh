@@ -1,5 +1,5 @@
 #!/bin/sh
-# One ping before the drivers start; its state is checkpointed.
+# One ping before the drivers start.
 . "$(dirname "$0")/helper_assert.sh"
 r=$(echo "ping 0" | nc pong 7000)
 echo "$r"

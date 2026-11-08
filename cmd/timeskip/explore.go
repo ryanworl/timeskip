@@ -20,8 +20,8 @@ import (
 // with seeds of their own, as Antithesis branches from interesting moments.
 
 // A branchPoint is a timeline saved at such a moment: a checkpoint, which
-// like a first_ checkpoint refers to its setup checkpoint's bundle and
-// placeholder, with what's needed to go on from it (in its branch.json).
+// refers to its setup checkpoint's bundle and placeholder, with what's
+// needed to go on from it (in its branch.json).
 type branchPoint struct {
 	*checkpoint
 	Template string     `json:"template"`
