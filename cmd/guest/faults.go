@@ -850,18 +850,21 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 		// as the stop comes) can't change what takes it. If it doesn't
 		// freeze, or Docker reports no kill while it's frozen, what was
 		// read may have changed by the signal: then any code after the
-		// signal is the stop's, as in Antithesis.
+		// signal is the stop's, as in Antithesis. If its process had
+		// exited already (a crash, which Docker may not have noticed: it
+		// still signals it), or Docker sent no signal, nothing after is the
+		// stop's.
 		var sent chan bool
 		ended := make(chan struct{})
 		if f.Kind == "stop" {
 			in.r.pausing(c, true) // (see runner.enter)
-			thaw, ok := frozen(c)
-			if code, takes := stopExits(c); takes || !ok {
-				signaled.Store(c.ID, map[bool]string{true: code}[ok])
+			thaw, ok, none := frozen(c)
+			if code, takes := stopExits(c); takes && ok && !none {
+				signaled.Store(c.ID, code)
 			}
 			sent = make(chan bool, 1)
 			go func() {
-				k := ok && awaitKill(c.ID, n, ended)
+				k := none || ok && awaitKill(c.ID, n, ended)
 				thaw()
 				in.r.pausing(c, false)
 				sent <- k
@@ -873,8 +876,12 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 			if err != nil { // (no signal coming)
 				close(ended)
 			}
-			if !<-sent {
-				signaled.Store(c.ID, "")
+			if !<-sent { // (a signal it sent unfrozen, if any: Docker reports it soon after its stop returns)
+				late := make(chan struct{})
+				time.AfterFunc(5*time.Second, func() { close(late) })
+				if awaitKill(c.ID, n, late) {
+					signaled.Store(c.ID, "")
+				}
 			}
 		}
 		if exited(err) { // (it exited since current)

@@ -1,0 +1,62 @@
+# expect: 1. A crash before a stop counts with init: true too, though the
+# init (tini) runs on: workload holds racer's tini with SIGSTOP, has
+# racer's shell leave a sleep for tini to adopt and exit 1, and, once the
+# shell is a zombie tini hasn't reaped, waits for a stop's SIGTERM to reach
+# tini (stops are racer's only node fault) before it lets tini go on, to
+# exit 1. The shell had exited before the stop, so the exit is the crash's
+# (as racer's main child had exited, whatever child tini adopted), and
+# e2e_test.go checks that some timeline reached "a stop met tini after the
+# crash" and that every one that did failed with it.
+# errors: (containers: \S*racer\S* exited with code 1)?
+# args: --timelines 16 --seed 1
+x-timeskip:
+  faults: high_availability
+  fault_gap: 0.2
+services:
+  racer:
+    image: busybox:1.36
+    init: true
+    labels: {com.antithesis.exclude_from_faults: "network,pause,kill,throttle,clock,disk"}
+    volumes: [shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        [ -f /shared/crashed ] && exec sleep 2147483647
+        until [ -f /shared/crash ]; do sleep 0.01; done
+        : > /shared/crashed
+        sleep 2147483647 &
+        exit 1
+  workload:
+    labels: {com.antithesis.exclude_from_faults: "network,pause,stop,kill,throttle,clock,disk"}
+    image: busybox:1.36
+    pid: host
+    volumes: [shared:/shared]
+    command:
+      - sh
+      - -c
+      - |
+        d=/opt/antithesis/test/v1/t && mkdir -p $$d
+        cat > $$d/singleton_driver_x <<'EOF'
+        #!/bin/sh
+        # state PID: the state in /proc/PID/stat; children PID: the PIDs and states of its children.
+        state() { s=$$(cat /proc/$$1/stat 2>/dev/null) && s=$${s##*) } && echo $${s%% *}; }
+        children() { for p in /proc/[0-9]*; do s=$$(cat $$p/stat 2>/dev/null) && s=$${s##*) } && set -- $$s && [ "$$2" = "$$t" ] && echo "$${p#/proc/} $$1"; done; }
+        pending() { m=$$(sed -n 's/^ShdPnd:[[:space:]]*//p' /proc/$$t/status) && [ $$(( 0x$$m & 0x4000 )) -ne 0 ]; }
+        poll() { i=0; until "$$@"; do [ $$i -ge 300 ] && return 1; sleep 0.01; i=$$((i+1)); done; }
+        tini() { for p in /proc/[0-9]*; do [ "$$(cat $$p/comm 2>/dev/null)" = docker-init ] && t=$${p#/proc/} && return; done; return 1; }
+        zombie() { children | grep -q ' Z$$'; }
+        held() { [ "$$(state $$t)" = T ]; }
+        if poll tini && kill -STOP $$t && poll held && ! pending; then
+          touch /shared/crash
+          if poll zombie && held && ! pending && poll pending; then
+            echo '{"antithesis_assert": {"assert_type": "sometimes", "display_type": "Sometimes", "message": "a stop met tini after the crash", "condition": true, "hit": true, "must_hit": true}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+          fi
+        fi
+        kill -CONT $$t 2>/dev/null
+        sleep 1
+        EOF
+        chmod +x $$d/singleton_driver_x
+        echo '{"antithesis_setup": {"status": "complete", "details": null}}' >> $$ANTITHESIS_OUTPUT_DIR/sdk.jsonl
+        exec sleep 2147483647
+volumes: {shared: {}}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -185,25 +186,39 @@ func signaledExits(cs []container, codes map[string]string, n int) {
 // not, it thaws it again at once. Frozen, its processes can't exec, and
 // their signal dispositions stay as they are, while a stop reads them and
 // Docker signals them (a signal to a frozen process is taken or dropped
-// as it's sent, by them).
-func frozen(c container) (thaw func(), ok bool) {
+// as it's sent, by them). none is whether it has no process (ok too): it
+// exited, maybe as Docker hasn't noticed yet, so no signal is taken.
+func frozen(c container) (thaw func(), ok, none bool) {
 	thaw = func() {}
 	var d container
-	if call("GET", "/containers/"+c.ID+"/json", nil, &d) != nil || d.State.Pid == 0 {
-		return thaw, false
+	if call("GET", "/containers/"+c.ID+"/json", nil, &d) != nil {
+		return thaw, false, false
+	}
+	if d.State.Pid == 0 {
+		return thaw, true, true
 	}
 	dir, err := cgroupDir(d)
-	if err != nil || os.WriteFile(dir+"/cgroup.freeze", []byte("1"), 0) != nil {
-		return thaw, false
+	if err == nil {
+		err = os.WriteFile(dir+"/cgroup.freeze", []byte("1"), 0)
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return thaw, true, true
+	}
+	if err != nil {
+		return thaw, false, false
 	}
 	thaw = func() { os.WriteFile(dir+"/cgroup.freeze", []byte("0"), 0) }
 	for t := time.Now(); time.Since(t) < time.Second; time.Sleep(time.Millisecond) {
-		if b, _ := os.ReadFile(dir + "/cgroup.events"); strings.Contains(string(b), "frozen 1") {
-			return thaw, true
+		b, err := os.ReadFile(dir + "/cgroup.events")
+		if errors.Is(err, fs.ErrNotExist) { // (it exited as it froze)
+			return func() {}, true, true
+		}
+		if strings.Contains(string(b), "frozen 1") {
+			return thaw, true, false
 		}
 	}
 	thaw() // (a task that doesn't freeze, as in an uninterruptible sleep)
-	return func() {}, false
+	return func() {}, false, false
 }
 
 // awaitKill is whether Docker reports a signal it sent container id after
@@ -238,14 +253,18 @@ func awaitKill(id string, n int, ended <-chan struct{}) bool {
 // Docker signals its init (tini), which forwards the signal to its child
 // only once it has taken it itself, after the stop's freeze ends, so what
 // the child does with it can't be known beforehand; and init exits with
-// the child's code.
+// the child's code. That is, while its child runs: once that has exited,
+// the code is the child's own.
 func stopExits(c container) (code string, ok bool) {
 	var d container
 	if call("GET", "/containers/"+c.ID+"/json", nil, &d) != nil || d.State.Pid == 0 {
 		return "", false
 	}
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", d.State.Pid)); err != nil || zombie(b) {
+		return "", false // (exited, as Docker may not have noticed yet)
+	}
 	if m := d.HostConfig.PidMode; d.HostConfig.Init && m != "host" && !strings.HasPrefix(m, "container:") {
-		return "", true
+		return "", mainChildRuns(d.State.Pid)
 	}
 	pid := d.State.Pid
 	sig := stopSignal(d.Config.StopSignal)
@@ -256,6 +275,55 @@ func stopExits(c container) (code string, ok bool) {
 		return strconv.Itoa(128 + int(sig)), true
 	}
 	return "", false
+}
+
+// mainChildRuns is whether init process pid's main child, the one whose
+// code it exits with, hasn't exited (as tini's, whatever children it
+// adopted). That is its earliest child (by start time, then PID), which
+// started before any process it left for init to adopt; unless init has
+// just reaped it, and is about to exit with its code.
+// (The kernel has no /proc/PID/task/TID/children: CONFIG_PROC_CHILDREN.)
+func mainChildRuns(pid int) bool {
+	ds, _ := os.ReadDir("/proc")
+	var first []byte
+	var start, firstPID uint64
+	for _, e := range ds {
+		n, err := strconv.ParseUint(e.Name(), 10, 64)
+		if err != nil {
+			continue
+		}
+		b, _ := os.ReadFile("/proc/" + e.Name() + "/stat")
+		i := bytes.LastIndex(b, []byte(") "))
+		if i < 0 {
+			continue
+		}
+		f := strings.Fields(string(b[i+2:]))
+		if len(f) < 20 || f[1] != strconv.Itoa(pid) {
+			continue
+		}
+		t, _ := strconv.ParseUint(f[19], 10, 64) // starttime
+		if first == nil || t < start || t == start && n < firstPID {
+			first, start, firstPID = b, t, n
+		}
+	}
+	return first != nil && !zombie(first)
+}
+
+// zombie is whether a process's /proc/PID/stat says it exited (Z, X) or
+// is exiting (PF_EXITING in its flags: still R or D in do_exit, which the
+// cgroup freezer counts as frozen without stopping it).
+// (The fields follow the command, in parentheses, which may hold ") ".)
+func zombie(stat []byte) bool {
+	i := bytes.LastIndex(stat, []byte(") "))
+	if i < 0 {
+		return true
+	}
+	f := strings.Fields(string(stat[i+2:]))
+	if len(f) < 7 || f[0] == "Z" || f[0] == "X" {
+		return true
+	}
+	flags, err := strconv.ParseUint(f[6], 10, 64)
+	return err != nil || flags&0x4 != 0 // PF_EXITING
 }
 
 // takes is whether process pid is running (not exited, nor a zombie) and

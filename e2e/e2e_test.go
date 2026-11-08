@@ -810,6 +810,24 @@ func TestProtocol(t *testing.T) {
 					}
 				}
 			}
+			// faultcrashinit.yaml: some timeline had a stop meet tini after
+			// racer's crash, and each that did failed with it.
+			if name == "faultcrashinit" {
+				met := 0
+				for _, tl := range r.Timelines {
+					for _, a := range tl.Assertions {
+						if a.Message == "a stop met tini after the crash" && a.True > 0 {
+							met++
+							if len(tl.Errors) == 0 {
+								t.Errorf("timeline %d: a stop met tini after the crash, but no errors", tl.Seed)
+							}
+						}
+					}
+				}
+				if met == 0 {
+					t.Errorf("no timeline had a stop meet tini after the crash")
+				}
+			}
 			// faultstop.yaml: a stop starts with its SIGTERM, which the
 			// server ignores, so it lasts the 10 s until Docker's SIGKILL
 			// and more, even when ANTITHESIS_STOP_FAULTS heals it at once
