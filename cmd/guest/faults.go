@@ -227,13 +227,16 @@ func pauseCount() int {
 
 // schedule makes faults with next, one at a time: each gap/100 to gap after
 // the last, for 0.1 to 30 s (each about a fifth of the time); next returns the
-// fault and how to heal it, or none. Each start and end is due at a time
-// planned from the last one's, not from when the last change was done, so
-// that the time making and healing faults takes (stopping and starting
+// fault and how to heal it, or none. A fault counts from when next returns
+// it, or from when next calls start, if making it takes time: a stop counts
+// from its first SIGTERM, which may take 10 s to stop a container, and its
+// line, once it's made, says when that was. Each start and end is due at a
+// time planned from the last one's, not from when the last change was done,
+// so that the time making and healing faults takes (stopping and starting
 // containers, say) doesn't shift the faults after it.
 // A fault stopped early by ANTITHESIS_STOP_FAULTS is healed then; one due
 // while faults are stopped starts when they resume, and the plan with it.
-func (in *injector) schedule(rng *rand.Rand, next func(*rand.Rand) (*protocol.Fault, func() error, error)) {
+func (in *injector) schedule(rng *rand.Rand, next func(*rand.Rand, func()) (*protocol.Fault, func() error, error)) {
 	due := time.Now()
 	for {
 		due = due.Add(logUniform(rng, in.gap/100, in.gap))
@@ -249,7 +252,9 @@ func (in *injector) schedule(rng *rand.Rand, next func(*rand.Rand) (*protocol.Fa
 		} else if waited {
 			due = time.Now()
 		}
-		f, heal, err := next(rng)
+		var t time.Duration
+		var once sync.Once
+		f, heal, err := next(rng, func() { once.Do(func() { t = uptime() }) })
 		// (Drawn even if no fault was made, so that what follows doesn't
 		// depend on it.)
 		due = due.Add(logUniform(rng, 100*time.Millisecond, 30*time.Second))
@@ -261,9 +266,14 @@ func (in *injector) schedule(rng *rand.Rand, next func(*rand.Rand) (*protocol.Fa
 			}
 			continue
 		}
-		t := uptime()
+		since := ""
+		if t > 0 {
+			since = fmt.Sprintf(" (since %.2fs)", t.Seconds())
+		} else {
+			t = uptime()
+		}
 		f.AtMs = (t - in.r.t0).Milliseconds()
-		say("fault: %s (%s) %s", f.Kind, f.Detail, strings.Trim(fmt.Sprint(f.Targets), "[]"))
+		say("fault: %s (%s) %s%s", f.Kind, f.Detail, strings.Trim(fmt.Sprint(f.Targets), "[]"), since)
 		stopped := !in.sleep(time.Until(due), true, nil)
 		if err := heal(); err != nil {
 			in.errorf("healing a %s: %v", f.Kind, err)
@@ -466,7 +476,7 @@ func current() (map[string]container, error) {
 }
 
 // network makes a partition or a clog, stopped, slowed or jammed.
-func (in *injector) network(rng *rand.Rand) (*protocol.Fault, func() error, error) {
+func (in *injector) network(rng *rand.Rand, _ func()) (*protocol.Fault, func() error, error) {
 	targets := in.targets("network")
 	if len(in.nodes) < 2 || len(targets) == 0 {
 		return nil, nil, nil
@@ -750,7 +760,7 @@ func inNetns(c container, command, input string) error {
 // node pauses, stops, kills or throttles nodes (resilient: only pauses
 // and throttles), as pick picks them. Test commands running in them
 // pause or are killed with them (see downed).
-func (in *injector) node(rng *rand.Rand) (*protocol.Fault, func() error, error) {
+func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() error, error) {
 	kinds := []int{0, 1, 2, 3}
 	if in.level == "resilient" {
 		kinds = []int{0, 3}
@@ -836,6 +846,9 @@ func (in *injector) node(rng *rand.Rand) (*protocol.Fault, func() error, error) 
 		// before the stop's signal does.
 		if f.Kind == "stop" && catchesTerm(c) {
 			signaled.Store(c.ID, true)
+		}
+		if f.Kind == "stop" { // (it counts from the first SIGTERM, which Docker's stop sends at once)
+			start()
 		}
 		err := do(c)
 		if exited(err) { // (it exited since current)

@@ -139,7 +139,7 @@ func (in *injector) throttle(rng *rand.Rand, cs []container) (*protocol.Fault, f
 // modulate varies the CPU speed of every container, all together: every 0.1
 // to 1 s, a new speed, 10% to 100% of the CPU, for the cgroups the nodes'
 // containers are in (Docker's), until healed.
-func (in *injector) modulate(rng *rand.Rand) (*protocol.Fault, func() error, error) {
+func (in *injector) modulate(rng *rand.Rand, _ func()) (*protocol.Fault, func() error, error) {
 	// (A generator of its own for the changes, so that the schedule's draws
 	// don't depend on how many there were.)
 	mrng := rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64()))

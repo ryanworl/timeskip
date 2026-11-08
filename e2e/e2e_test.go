@@ -792,6 +792,27 @@ func TestProtocol(t *testing.T) {
 					}
 				}
 			}
+			// faultstop.yaml: a stop starts with its SIGTERM, which the
+			// server ignores, so it lasts the 10 s until Docker's SIGKILL
+			// and more, even when ANTITHESIS_STOP_FAULTS heals it at once
+			// (else it would seem to start when the server exited, inside
+			// the quiet time).
+			if name == "faultstop" {
+				stops := 0
+				for _, tl := range r.Timelines {
+					for _, f := range tl.Faults {
+						if f.Kind == "stop" {
+							stops++
+							if f.Ms < 10000 {
+								t.Errorf("timeline %d: a stop at %d ms lasted %d ms, want 10000 or more", tl.Seed, f.AtMs, f.Ms)
+							}
+						}
+					}
+				}
+				if stops == 0 {
+					t.Errorf("no stop faults")
+				}
+			}
 			// containerlogs.yaml: the ticker's stderr from setup, before
 			// the timeline's start; and its ticks, whose guest times less
 			// the uptime they print stay put (but for the time Docker took to

@@ -2,7 +2,8 @@
 # the faults in effect are healed, even while a stop takes 10 s (the server
 # ignores SIGTERM): no fault waits out its time and no new one starts
 # meanwhile. (Else calls take minutes; the bound leaves room for a loaded
-# host.) The server answers right after.
+# host.) The server answers right after. A stop counts from its SIGTERM:
+# it lasts 10 s or more (see TestProtocol).
 # (Seeds whose timelines all draw node faults: see README.md, Mixing.)
 # args: --timelines 4 --seed 11
 x-timeskip:

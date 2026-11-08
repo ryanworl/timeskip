@@ -374,7 +374,7 @@ func nodeDisks(cs []container) []*disk {
 // (see timeskip_fail in guest/kernel/timeskip.patch), so it stays whole.
 // Its nodes whose reads or writes failed may be rebooted as it heals, so
 // nodes excluded from kills don't get one.
-func (in *injector) disk(rng *rand.Rand) (*protocol.Fault, func() error, error) {
+func (in *injector) disk(rng *rand.Rand, _ func()) (*protocol.Fault, func() error, error) {
 	kinds := slices.DeleteFunc(slices.Clone(in.diskKinds), func(k string) bool { return k == "power" })
 	kind := kinds[0]
 	if len(kinds) > 1 { // (a draw only then, so that other seeds' faults stay as they were)
