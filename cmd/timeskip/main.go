@@ -52,6 +52,8 @@ const usage = `usage:
         drivers: driver launches per timeline (default 10).
         timeout: guest seconds a timeline may run (default 3600).
         memory: the VMs' memory in GiB (default 4).
+        timer_slack: how late the guest's timers may fire, so that they
+          share wakeups (default 1ms).
       --out DIR writes results.json, each instrumented module's functions
       (coverage/MODULE.functions.tsv) and, with --profile, each timeline's
       stacks sampled every 10 ms of CPU time (profiles/TEMPLATE-SEED.folded).
@@ -77,8 +79,9 @@ removed from it.
 var (
 	home     string // the kit: this executable's directory
 	cache    string
-	memMB    = 4096 // the VMs' memory (x-timeskip's memory)
-	noBuild  bool   // --no-build
+	memMB          = 4096           // the VMs' memory (x-timeskip's memory)
+	slackNS  int64 = defaultSlackNS // the guest's timer slack (x-timeskip's timer_slack)
+	noBuild  bool                   // --no-build
 	darwin   = runtime.GOOS == "darwin"
 	hostArch = runtime.GOARCH
 )
@@ -149,8 +152,14 @@ func settings(js string, sets []string, o *options) {
 			o.timeout = int(num(k, 1))
 		case "memory":
 			memMB = int(num(k, 1)) << 10
+		case "timer_slack":
+			d, err := time.ParseDuration(fmt.Sprint(v))
+			if err != nil || d <= 0 {
+				die("x-timeskip: timer_slack is a duration above 0, such as 10ms")
+			}
+			slackNS = d.Nanoseconds()
 		default:
-			die("x-timeskip: no setting %s (faults, disk_faults, fault_gap, drivers, timeout, memory)", k)
+			die("x-timeskip: no setting %s (faults, disk_faults, fault_gap, drivers, timeout, memory, timer_slack)", k)
 		}
 	}
 	if len(o.diskFaults) > 0 && o.faults == "" {

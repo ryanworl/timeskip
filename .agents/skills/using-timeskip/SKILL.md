@@ -53,6 +53,7 @@ x-timeskip:
   drivers: 10                 # driver launches per timeline
   timeout: 3600               # guest seconds a timeline may run
   memory: 4                   # the VMs' memory, GiB
+  timer_slack: 1ms            # how late the guest's timers may fire; larger: fewer wakeups, faster timelines
 ```
 
 - **Faults are on by default**, by Antithesis's fault tolerance levels, from the end of the `first_` command until the ending: baseline latency, partitions and clogs (`legacy`); plus pauses, throttles, CPU modulation and clock skips (`resilient`); plus stops and kills of containers, then restarts (`high_availability`). Thread pausing runs at every level. Timelines mix them: each draws its gap, and half leave node faults out. docs/reference.md's Faults has the details.

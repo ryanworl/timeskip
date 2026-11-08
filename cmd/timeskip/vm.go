@@ -87,7 +87,22 @@ func cmdline(nonce, root string) string {
 	if darwin {
 		c = "hvc0"
 	}
-	return fmt.Sprintf("console=%s root=%s ro rootfstype=erofs init=/init quiet loglevel=1 reboot=k panic=1 timeskip=1 ts.nonce=%s", c, root, nonce)
+	return fmt.Sprintf("console=%s root=%s ro rootfstype=erofs init=/init quiet loglevel=1 reboot=k panic=1 timeskip=1 ts.nonce=%s%s", c, root, nonce, slackArg())
+}
+
+// defaultSlackNS is the guest's timer slack unless x-timeskip's timer_slack
+// sets it (see guest/init).
+const defaultSlackNS = 1000000
+
+// slackArg is the guest kernel's command-line argument that sets its timer
+// slack, which init applies before anything else starts, or "" for the
+// default. It's in the names of the checkpoints a boot made too, so those
+// of the default keep theirs.
+func slackArg() string {
+	if slackNS == defaultSlackNS {
+		return ""
+	}
+	return fmt.Sprintf(" ts.slack=%d", slackNS)
 }
 
 // start starts a VMM. Booting, it gets disks, then the root filesystem

@@ -93,7 +93,7 @@ func kitID() string {
 // origin), saving it first if there isn't one, or why setup failed. It holds
 // the checkpoint (a shared lock) until this process exits.
 func setupCheckpoint(b, origin string) (*checkpoint, error) {
-	c, err := saved(hash(bundle.ID(b), kitID(), memMB), func(c *checkpoint) error {
+	c, err := saved(hash(bundle.ID(b), kitID(), memMB, slackArg()), func(c *checkpoint) error {
 		// (A project's bundle in the cache leaves out the images it doesn't
 		// build: they're loaded in an images checkpoint, kept for its next
 		// builds.)
@@ -153,10 +153,10 @@ func imagesCheckpoint(images []string) (*checkpoint, error) {
 
 // baseCheckpoint returns the base checkpoint, which every bundle's setup
 // starts from: a VM booted with a blank data disk and dockerd up, saved once
-// for the kit (and the VM's memory size). It holds it (a shared lock) until
+// for the kit (and the VM's memory size and timer slack). It holds it (a shared lock) until
 // this process exits.
 func baseCheckpoint() *checkpoint {
-	c, _ := saved(hash("base", kitID(), memMB), func(c *checkpoint) error { buildBase(c); return nil })
+	c, _ := saved(hash("base", kitID(), memMB, slackArg()), func(c *checkpoint) error { buildBase(c); return nil })
 	return c
 }
 

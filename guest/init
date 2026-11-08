@@ -15,10 +15,15 @@ mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
 mount --make-rshared /
-# Timers of every process (inherited from here) may fire up to 1 ms late, so
-# that the Go runtimes' short sleeps and the like share timer interrupts:
-# each costs the host two VM exits, and a guest that waits skips the time.
-echo 1000000 >/proc/$$/timerslack_ns
+# Timers of every process (inherited from here) may fire up to 1 ms late
+# (x-timeskip's timer_slack: ts.slack on the command line), so that the Go
+# runtimes' short sleeps and the like share timer interrupts: each costs the
+# host two VM exits, and a guest that waits skips the time.
+slack=1000000
+for a in $(cat /proc/cmdline); do
+  case $a in ts.slack=*) slack=${a#ts.slack=} ;; esac
+done
+echo "$slack" >/proc/$$/timerslack_ns
 ip link set lo up
 
 up() { cut -d' ' -f1 /proc/uptime; }

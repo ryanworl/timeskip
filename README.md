@@ -42,6 +42,7 @@ cd ~/.local/share/timeskip
     drivers: 10                 # driver launches per timeline
     timeout: 3600               # guest seconds a timeline may run
     memory: 4                   # VM memory, GiB
+    timer_slack: 1ms            # how late the guest's timers may fire
   ```
 
 Useful flags: `--timelines N`, `--seed N`, `--template NAME`, `-j N` (VMs at once; default one per core), `--no-skip` (real time), `--out DIR` (writes `results.json`), `--explore` (branch timelines from new behavior), `--max-failures N` (stop once N timelines failed; `first:N`, in their `first_` command), `--profile`. `timeskip bundle -o app.tsb` writes a bundle that runs elsewhere with `timeskip test app.tsb`.
