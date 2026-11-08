@@ -176,6 +176,10 @@ type Result struct {
 	// The CPU time each container used (its cgroup's, test commands'
 	// included), by name, in ms.
 	ContainerCPUMs map[string]int64 `json:"container_cpu_ms,omitempty"`
+	// Of the processes running at the end, the five of the containers and
+	// the three of the VM's own that woke up most since setup (the first_
+	// command included): what kept the timeline from skipping more time.
+	Wakers []Waker `json:"wakers,omitempty"`
 	// With Go's Profile: the stacks sampled, folded (container;command;
 	// outermost frame;...;innermost), each every 10 ms of CPU time.
 	Profile map[string]int64 `json:"profile,omitempty"`
@@ -184,6 +188,17 @@ type Result struct {
 	// gzipped, in base64.
 	Coverage map[string]Coverage `json:"coverage,omitempty"`
 	Symbols  map[string]string   `json:"symbols,omitempty"`
+}
+
+// A Waker is a process that woke up during a timeline (see Result's
+// Wakers).
+type Waker struct {
+	Container string `json:"container,omitempty"` // its container's name; none for the VM's own processes
+	Process   string `json:"process"`             // its command; a kernel thread's in brackets
+	PID       int    `json:"pid"`
+	Wakeups   int64  `json:"wakeups"`  // its live threads' voluntary context switches: sleeps, each ended by a wake-up
+	CPUMs     int64  `json:"cpu_ms"`   // the CPU time it used, in steps of 10 ms
+	EveryMs   int64  `json:"every_ms"` // guest time per wake-up, on average
 }
 
 // Coverage is a module's edges, 0 to Edges, and a bit per edge reached, in

@@ -220,6 +220,7 @@ func setup(bundle string) {
 	sumTargets()
 	cat, _, err := discover()
 	check(err)
+	countSetup()
 	freeze(true)
 	msg("READY", protocol.Ready{Catalog: cat.wire()})
 }

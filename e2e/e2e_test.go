@@ -100,6 +100,11 @@ type assertion struct {
 	FirstFalseMs int64 `json:"first_false_ms"`
 }
 
+type waker struct {
+	Container, Process string
+	EveryMs            int64 `json:"every_ms"`
+}
+
 type timeline struct {
 	Template, First, From string
 	Seed                  uint64
@@ -120,6 +125,7 @@ type timeline struct {
 		CPUMs int64 `json:"cpu_ms"`
 	}
 	ContainerCPUMs map[string]int64 `json:"container_cpu_ms"`
+	Wakers         []waker
 	Assertions     []assertion
 	Faults         []struct {
 		Kind, Detail string
@@ -900,6 +906,10 @@ func TestProtocol(t *testing.T) {
 				}
 				if w, i := tl.ContainerCPUMs["antithesis-workload-1"], tl.ContainerCPUMs["antithesis-idle-1"]; w < cpu["singleton_driver_spin"] || i > cpu["singleton_driver_spin"]/5 {
 					t.Errorf("container_cpu_ms %v", tl.ContainerCPUMs)
+				}
+				// (Reading at timeouts of 5 ms, and a little more each time.)
+				if i := slices.IndexFunc(tl.Wakers, func(w waker) bool { return w.Container == "antithesis-ticker-1" && w.Process == "sh" }); i < 0 || tl.Wakers[i].EveryMs < 5 || tl.Wakers[i].EveryMs > 8 {
+					t.Errorf("wakers %+v, want the ticker's sh, every 5 to 8 ms", tl.Wakers)
 				}
 			}
 			// profile.yaml: samples of dd's CPU time, symbolized, none of the

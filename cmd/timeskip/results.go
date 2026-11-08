@@ -235,9 +235,10 @@ func printTimeline(r run, status string, o options, count string) {
 }
 
 // mostCPU prints where the guests' CPU time went, summed over the runs: the
-// five test commands and the five containers that used the most.
+// five test commands and the five containers that used the most; and the
+// five processes of the containers that woke up most.
 func mostCPU(runs []run) {
-	cmds, ctrs := map[string]int64{}, map[string]int64{}
+	cmds, ctrs, wakes := map[string]int64{}, map[string]int64{}, map[string]int64{}
 	for _, r := range runs {
 		for _, c := range r.Commands {
 			cmds[r.Template+"/"+c.Name] += c.CPUMs
@@ -245,9 +246,22 @@ func mostCPU(runs []run) {
 		for n, ms := range r.ContainerCPUMs {
 			ctrs[n] += ms
 		}
+		for _, w := range r.Wakers {
+			if w.Container != "" {
+				wakes[w.Container+"/"+w.Process] += w.Wakeups
+			}
+		}
 	}
 	mostIn("commands", cmds)
 	mostIn("containers", ctrs)
+	names := slices.SortedFunc(maps.Keys(wakes), func(a, b string) int { return cmp.Or(cmp.Compare(wakes[b], wakes[a]), cmp.Compare(a, b)) })
+	var l []string
+	for _, n := range names[:min(5, len(names))] {
+		l = append(l, fmt.Sprintf("%s %d", n, wakes[n]))
+	}
+	if len(l) > 0 {
+		fmt.Fprintf(os.Stderr, "most wake-ups (containers' processes): %s\n", strings.Join(l, ", "))
+	}
 }
 
 // mostIn prints the five things in ms that used the most CPU time (ms).

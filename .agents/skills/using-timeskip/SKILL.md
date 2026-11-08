@@ -22,7 +22,7 @@ description: "Runs a Docker Compose project's Antithesis-style test templates in
 - **Assertions**: use an Antithesis SDK (it writes through the `/usr/lib/libvoidstar.so` timeskip mounts in, as on Antithesis), or have a command append lines to `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl` itself: `{"antithesis_assert": {"id": "every write is readable", "message": "every write is readable", "assert_type": "always", "display_type": "Always", "condition": true, "hit": true, "must_hit": true}}`. `assert_type` is `always`, `sometimes` or `reachability`. A command that exits non-zero fails too, as do a container exiting with a code other than 0, 137 or 143 and a process killed by SIGSEGV, SIGABRT and the like.
 - **Edits**: each component you rebuild on the host, test commands included, has a `develop.watch` sync rule, e.g. `{action: sync, path: ./test, target: /opt/antithesis/test/v1/main}` or `{action: sync+restart, path: ./bin/api, target: /usr/local/bin/api}`. Edits elsewhere in a build context rebuild the image by themselves; a `rebuild` rule is only needed for paths outside it.
 - **Tests that start containers through Docker** (dockertest, Testcontainers): give the test container the VM's `/var/run/docker.sock` and `network_mode: host`, and list each image the tests start, under its exact name, in a never-started profile so it's bundled: the VM can't pull.
-- Polling is fine but each poll is a wake-up: long poll intervals and healthcheck `interval`s keep the speedup high.
+- Polling is fine but each poll is a wake-up: long poll intervals and healthcheck `interval`s keep the speedup high. `results.json`'s `wakers` (and the run's `most wake-ups` line) name the processes that woke up most in each timeline, with `every_ms`, their average interval.
 
 ## The loop
 

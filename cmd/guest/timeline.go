@@ -692,7 +692,7 @@ func (r *runner) finish() {
 	noting.Lock() // (for good: see watch)
 	sdkScan()     // (the assertions' last first falses)
 	msg("EXIT", protocol.Exit{Kind: "timeline", Result: &protocol.Result{GuestMs: ms, Skips: skips() - r.s0,
-		Commands: commands, Assertions: assertions(), Errors: errs, Faults: faults, FaultMix: faultMix, FaultGapMs: faultGapMs, TimedOut: timedOut, ContainerCPUMs: cpu, Profile: stacks,
+		Commands: commands, Assertions: assertions(), Errors: errs, Faults: faults, FaultMix: faultMix, FaultGapMs: faultGapMs, TimedOut: timedOut, ContainerCPUMs: cpu, Wakers: wakers(cs), Profile: stacks,
 		Coverage: cov, Symbols: syms, FailedMs: r.failMs}})
 	// (If it failed, the CLI asks for the containers' logs; if not, it
 	// stops the VM.)
