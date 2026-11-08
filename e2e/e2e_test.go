@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -260,8 +261,13 @@ func TestDemo(t *testing.T) {
 		if len(d.Timelines)+len(e.Timelines) != 2 || len(d.Timelines[0].Faults) < 2 {
 			t.Fatal("no faults")
 		}
+		// (In the order they started: results.json lists them as they
+		// healed, and the ending, whose moment varies with the host's
+		// speed, heals the ones still in effect.)
 		plan := func(r result) (l []string) {
-			for _, f := range r.Timelines[0].Faults {
+			fs := slices.Clone(r.Timelines[0].Faults)
+			sort.SliceStable(fs, func(i, j int) bool { return fs[i].AtMs < fs[j].AtMs })
+			for _, f := range fs {
 				l = append(l, fmt.Sprint(f.Kind, f.Detail, f.Targets))
 			}
 			return l
