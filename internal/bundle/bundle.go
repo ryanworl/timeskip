@@ -104,10 +104,9 @@ type Options struct {
 	// were built (recorded in out.inputs, with what their sync rules' paths
 	// held then, and their files' digests in out.sums), and leaves out of
 	// images.tar the images the project doesn't build (listed in the
-	// pulled file instead), for a VM that has them already. If Docker's
-	// daemon can't be reached, out is used as it is if that needs nothing
-	// from Docker: no image to build (each one's recorded inputs unchanged,
-	// and out holding the image recorded with them) and nothing else changed.
+	// pulled file instead), for a VM that has them already. Without
+	// Docker (see Create), an image built from unchanged recorded inputs
+	// is the one out holds.
 	Cache bool
 	// Synced packs what each sync rule's path holds, so that the bundle
 	// tested elsewhere gets the files a test here would sync.
@@ -126,7 +125,10 @@ type Options struct {
 
 // Create bundles the project in composeFile for linux/arch into out, and
 // returns its develop.watch sync rules. The same files and images leave out
-// as it is, so that what timeskip prepared from it stays valid.
+// as it is, so that what timeskip prepared from it stays valid. If Docker's
+// daemon can't be reached, out is used as it is if that needs nothing from
+// Docker: no image to build (see Options.Cache), the images it doesn't
+// build as out has them, and nothing else changed.
 func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 	plat, log := "linux/"+arch, o.Log
 	tmp, err := os.MkdirTemp(o.Tmp, "timeskip-bundle")
@@ -258,7 +260,7 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 	state, sums := map[string]record{}, fileSums{map[string]string{}, map[string]string{}}
 	// down is why Docker's daemon can't be reached, if it can't; then had
 	// is out's images, each name's line in its images file, which it must
-	// already hold (see Options.Cache).
+	// already hold (see Create).
 	var down error
 	had := map[string]string{}
 	if o.Cache {
@@ -266,13 +268,13 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		json.Unmarshal(b, &state)
 		b, _ = os.ReadFile(out + ".sums")
 		json.Unmarshal(b, &sums.was)
-		if _, err := output("docker", "version", "--format", "{{.Server.Version}}"); err != nil {
-			e := strings.TrimSpace(err.Error())
-			down = errors.New(e[strings.LastIndexByte(e, '\n')+1:])
-			for _, l := range strings.Split(Files(out)["images"], "\n") {
-				if img, id, ok := strings.Cut(l, " "); ok {
-					had[img] = id
-				}
+	}
+	if _, err := output("docker", "version", "--format", "{{.Server.Version}}"); err != nil {
+		e := strings.TrimSpace(err.Error())
+		down = errors.New(e[strings.LastIndexByte(e, '\n')+1:])
+		for _, l := range strings.Split(Files(out)["images"], "\n") {
+			if img, id, ok := strings.Cut(l, " "); ok {
+				had[img] = id
 			}
 		}
 	}
