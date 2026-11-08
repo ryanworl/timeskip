@@ -5,9 +5,6 @@ package main
 import (
 	"archive/tar"
 	"bytes"
-	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,51 +12,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"syscall"
 )
 
-// The host's edits arrive in /inputs: a virtiofs share (macOS), or an ext4
-// image the host swaps in for the third drive (Firecracker) before GO.
+// The sync rules' files arrive in /inputs for setup: on the bundle's
+// virtiofs share (macOS), or an ext4 image the host gives the VM as its
+// third drive (Firecracker).
 //
-//	replace     "service<TAB>target<TAB>name<TAB>action" per line: the
-//	            file or directory /inputs/<name> belongs at target in
-//	            service's containers, as a develop.watch rule with action
-//	            sync or sync+restart does
-//	delete      "service<TAB>target<TAB>name<TAB>action" per line: target
-//	            was deleted on the host, as part of the edit named name
-//	            (replace's, if it has a file)
-//	sums        "path<TAB>sha256" per line: each regular file's digest, by
-//	            its path in /inputs
+//	replace     "service<TAB>target<TAB>name" per line: the file or
+//	            directory /inputs/<name> belongs at target in service's
+//	            containers, as a develop.watch rule with action sync or
+//	            sync+restart puts it
+//	delete      "service<TAB>target" per line: target was deleted on the
+//	            host since service's image was built
 type edit struct {
-	service, target, name, action string
-	del                           bool
+	service, target, name string
+	del                   bool
 }
 
 func mountInputs(spec string) {
-	switch {
-	case spec == "virtiofs":
-		check(syscall.Mount("inputs", "/inputs", "virtiofs", syscall.MS_RDONLY, ""))
-	case strings.HasPrefix(spec, "blk:"):
+	if strings.HasPrefix(spec, "blk:") {
 		waitDrive("vdc", spec)
 		exec.Command("blockdev", "--flushbufs", "/dev/vdc").Run()
 		check(syscall.Mount("/dev/vdc", "/inputs", "ext4", syscall.MS_RDONLY, ""))
 	}
 }
 
-// inputSums are the digests of the regular files in /inputs, by path in it.
-var inputSums map[string]string
-
 func readEdits() []edit {
-	inputSums = map[string]string{}
-	if b, err := os.ReadFile("/inputs/sums"); err == nil {
-		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-			if p, sum, ok := strings.Cut(l, "\t"); ok {
-				inputSums[p] = sum
-			}
-		}
-	}
 	var e []edit
 	for _, f := range []string{"replace", "delete"} {
 		b, err := os.ReadFile("/inputs/" + f)
@@ -67,63 +47,68 @@ func readEdits() []edit {
 			continue
 		}
 		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-			x := strings.Split(l, "\t")
-			if len(x) == 4 {
-				e = append(e, edit{x[0], x[1], x[2], x[3], f == "delete"})
+			if x := append(strings.Split(l, "\t"), ""); len(x) >= 3 {
+				e = append(e, edit{x[0], x[1], x[2], f == "delete"})
 			}
 		}
 	}
 	return e
 }
 
-// apply applies edits as docker compose watch applies develop.watch sync
-// rules: what differs from a container's files (contents, type, mode or
-// link target) is copied in, with the host's owners; what was deleted on the
-// host is deleted. Then the services with a changed sync+restart rule
-// restart (and, as compose does, their dependents that set depends_on
-// restart: true), until ctx is done.
-func apply(ctx context.Context, edits []edit) {
-	var restart []string
+// apply applies the edits to the project's containers, created and not yet
+// started, so that they start with the host's files as if their images
+// held them, as docker compose watch syncs develop.watch sync rules: what
+// differs from a container's files (contents, type, mode or link target)
+// is copied in, with the host's owners; what was deleted on the host is
+// deleted.
+func apply(edits []edit) {
 	for _, e := range edits {
 		cs, err := containers(e.service)
 		check(err)
 		if len(cs) == 0 {
 			fail("can't apply the edit to %s:%s: %s has no container", e.service, e.target, e.service)
 		}
-		changed := false
 		for _, c := range cs {
+			root := mountRoot(c)
 			// (The target itself as it is, a symlink included, as compose
 			// watch replaces or deletes it.)
-			dst := filepath.Join(resolve(c.root(), filepath.Dir(e.target)), filepath.Base(e.target))
+			dst := filepath.Join(resolve(root, filepath.Dir(e.target)), filepath.Base(e.target))
+			src, put := "/inputs/"+e.name, false
 			if e.del {
-				if _, err := os.Lstat(dst); err == nil {
-					check(os.RemoveAll(dst))
-					changed = true
+				check(os.RemoveAll(dst))
+			} else if put = differs(src, dst); put {
+				checkReplacement(e, src, dst)
+			}
+			check(syscall.Unmount(root, 0))
+			if put { // (through Docker, which mounts the container's files itself)
+				var buf bytes.Buffer
+				check(tarOf(src, filepath.Base(e.target), &buf))
+				if err := untar(c.ID, filepath.Dir(e.target), &buf); err != nil {
+					fail("copying the edit to %s:%s: %v", e.service, e.target, err)
 				}
-				continue
 			}
-			src := "/inputs/" + e.name
-			if !differs(src, dst) {
-				continue
-			}
-			checkReplacement(e, src, dst)
-			var buf bytes.Buffer
-			check(tarOf(src, filepath.Base(e.target), &buf))
-			if err := untar(c.ID, filepath.Dir(e.target), &buf); err != nil {
-				fail("copying the edit to %s:%s: %v", e.service, e.target, err)
-			}
-			changed = true
-		}
-		if changed && e.action == "sync+restart" {
-			restart = append(restart, e.service)
 		}
 	}
-	slices.Sort(restart)
-	if restart = slices.Compact(restart); len(restart) > 0 {
-		check(composeCtx(ctx, append([]string{"restart"}, restart...)...))
-		say("restarted %s", strings.Join(restart, " "))
-		check(started())
+}
+
+// mountRoot mounts container c's files, as Docker's overlay2 driver does
+// when it starts it, at a directory of its own, and returns the directory.
+func mountRoot(c container) string {
+	layer := filepath.Dir(c.GraphDriver.Data["UpperDir"])
+	lower, err := os.ReadFile(filepath.Join(layer, "lower"))
+	check(err)
+	dir := "/run/timeskip-root"
+	check(os.MkdirAll(dir, 0o700))
+	// (Its layers' short names, relative to overlay2's directory, as Docker
+	// gives them: a mount's options have to fit in a page.)
+	id := filepath.Base(layer)
+	cmd := exec.Command("mount", "-t", "overlay", "overlay", "-o",
+		fmt.Sprintf("index=off,lowerdir=%s,upperdir=%s/diff,workdir=%s/work", strings.TrimSpace(string(lower)), id, id), dir)
+	cmd.Dir = filepath.Dir(layer)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fail("mounting %s's files: %v: %s", c.Name, err, out)
 	}
+	return dir
 }
 
 // differs reports whether src (a file or directory) isn't the same at dst.
@@ -141,7 +126,9 @@ func differs(src, dst string) bool {
 			lb, _ := os.Readlink(filepath.Join(dst, rel))
 			d = la != lb
 		case a.Mode().IsRegular():
-			d = a.Size() != b.Size() || !same(p, filepath.Join(dst, rel), b)
+			x, err1 := os.ReadFile(p)
+			y, err2 := os.ReadFile(filepath.Join(dst, rel))
+			d = err1 != nil || err2 != nil || !bytes.Equal(x, y)
 		}
 		if d {
 			return filepath.SkipAll
@@ -149,82 +136,6 @@ func differs(src, dst string) bool {
 		return nil
 	})
 	return d
-}
-
-// same reports whether file p in /inputs holds what file q, as fi, does:
-// by their digests, if q is as setup left it (see sumTargets), or else by
-// reading both. (The disks' reads take real time: the guest skips none
-// while a thread waits on them, and each timeline would read every synced
-// file, from a checkpoint without a page cache.)
-func same(p, q string, fi fs.FileInfo) bool {
-	rel, _ := filepath.Rel("/inputs", p)
-	if want, ok := inputSums[rel]; ok {
-		if have, ok := setupSums[statKey(q, fi)]; ok {
-			return want == have
-		}
-	}
-	x, err1 := os.ReadFile(p)
-	y, err2 := os.ReadFile(q)
-	return err1 == nil && err2 == nil && bytes.Equal(x, y)
-}
-
-// setupSums are the digests of the regular files under the sync rules'
-// targets as setup left them, by statKey: in the checkpoints, so that
-// every timeline compares its edits to files it didn't change without
-// reading them.
-var setupSums map[string]string
-
-// statKey is file p's path and what changing it changes.
-func statKey(p string, fi fs.FileInfo) string {
-	st := fi.Sys().(*syscall.Stat_t)
-	return fmt.Sprintf("%s %d %d %d %d %d", p, st.Ino, st.Size, st.Mtim.Nano(), st.Ctim.Nano(), fi.Mode())
-}
-
-// sumTargets fills setupSums from the containers of the services with
-// develop.watch sync rules.
-func sumTargets() {
-	b, err := os.ReadFile(bundled + "/compose.yaml")
-	check(err)
-	var p struct {
-		Services map[string]struct {
-			Develop struct {
-				Watch []struct{ Action, Target string }
-			}
-		}
-	}
-	check(json.Unmarshal(b, &p))
-	setupSums = map[string]string{}
-	for name, s := range p.Services {
-		for _, w := range s.Develop.Watch {
-			if w.Action != "sync" && w.Action != "sync+restart" {
-				continue
-			}
-			cs, err := containers(name)
-			check(err)
-			for _, c := range cs {
-				if c.State.Pid == 0 {
-					continue
-				}
-				root := filepath.Join(resolve(c.root(), filepath.Dir(w.Target)), filepath.Base(w.Target))
-				filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-					if err != nil || !d.Type().IsRegular() {
-						return nil
-					}
-					fi, err1 := d.Info()
-					f, err2 := os.Open(p)
-					if err1 != nil || err2 != nil {
-						return nil
-					}
-					defer f.Close()
-					h := sha256.New()
-					if _, err := io.Copy(h, f); err == nil {
-						setupSums[statKey(p, fi)] = fmt.Sprintf("%x", h.Sum(nil))
-					}
-					return nil
-				})
-			}
-		}
-	}
 }
 
 // tarOf archives src as name (a file, or a directory and its contents).

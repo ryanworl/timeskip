@@ -8,10 +8,10 @@ import (
 
 func TestGoRoundTrip(t *testing.T) {
 	for _, g := range []Go{
-		{Skip: true, Seed: 1<<63 + 5, Template: "my tests", First: "first_b, c=d.sh", Firsts: []string{"first_a", "first_b, c=d.sh"}, Drivers: 3,
-			Timeout: 90, Inputs: "blk:4096", Faults: 2.5, Level: "resilient", Disk: []string{"fail", "power"}, Profile: true, Symbols: true,
+		{Skip: true, Seed: 1<<63 + 5, Template: "my tests", First: "first_b, c=d.sh", Drivers: 3,
+			Timeout: 90, Faults: 2.5, Level: "resilient", Disk: []string{"fail", "power"}, Profile: true, Symbols: true,
 			Explore: true},
-		{Template: "u", Inputs: "none"}, // (empty lists come back nil)
+		{Template: "u"}, // (empty lists come back nil)
 	} {
 		if got := ParseGo(g.String()); !reflect.DeepEqual(got, g) {
 			t.Errorf("ParseGo(%q) = %+v, want %+v", g.String(), got, g)

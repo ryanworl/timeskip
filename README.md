@@ -31,7 +31,7 @@ cd ~/.local/share/timeskip
 - **Setup complete:** a container appends `{"antithesis_setup": {"status": "complete", "details": null}}` to `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl` (the Antithesis SDKs' `setup_complete` does this).
 - **Tests:** executables in `/opt/antithesis/test/v1/<template>/` inside a container, named with Test Composer prefixes: `first_`, `parallel_driver_`, `serial_driver_`, `singleton_driver_`, `anytime_`, `finally_`, `eventually_`.
 - **Assertions:** the Antithesis SDKs, or JSON lines appended to `$ANTITHESIS_OUTPUT_DIR/sdk.jsonl`.
-- **Edits:** `develop.watch` sync rules, as for `docker compose watch`, apply your host-side changes to each timeline.
+- **Edits:** `develop.watch` sync rules, as for `docker compose watch`, apply your host-side changes to the containers before setup starts them.
 - **Settings:** an optional `x-timeskip` block in the compose file; override any key with `--set KEY=VALUE`.
 
   ```yaml

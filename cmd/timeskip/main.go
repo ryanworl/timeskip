@@ -272,15 +272,13 @@ func main() {
 			now := time.Now()
 			os.Chtimes(d, now, now)
 		}
-		var edits []edit
 		var setup *checkpoint
 		if f := abs(project(pos)); bundle.Files(f) != nil {
 			if _, cached := bundle.Files(f)["pulled"]; cached {
 				fmt.Fprintf(os.Stderr, "timeskip: warning: %s is a project's bundle from the cache, without the project's x-timeskip settings and sync rules: it runs with the default settings (and --set's), so a seed may run otherwise than in the project; to replay a seed of the project, test the project\n", f)
 			}
 			settings(bundleFile(f, "settings"), o.sets, &o)
-			setup = mustSetup(setupCheckpoint(f, f))
-			edits = syncedEdits(f)
+			setup = mustSetup(setupCheckpoint(f, f, syncedEdits(f)))
 		} else {
 			// The project's bundle, in the cache, with the images it builds;
 			// the VM has the others already (see setupCheckpoint). A run
@@ -288,17 +286,18 @@ func main() {
 			var js string
 			mine, b, syncs, err := cachedBundle(f, &js, nil)
 			check(err)
+			var edits []edit
 			for _, s := range syncs {
-				e := edit{s.Service, s.Target, s.Path, s.Action, s.Skip, nil}
+				e := edit{s.Service, s.Target, s.Path, s.Skip, nil}
 				for _, p := range s.Deleted {
 					e.deleted = append(e.deleted, s.Target+strings.TrimPrefix(p, s.Path))
 				}
 				edits = append(edits, e)
 			}
 			settings(js, o.sets, &o)
-			setup = mustSetup(setupCheckpoint(mine, b))
+			setup = mustSetup(setupCheckpoint(mine, b, edits))
 		}
-		cmdTest(setup, edits, o)
+		cmdTest(setup, o)
 	case "version":
 		parse(fs, args, 0)
 		m, err := os.ReadFile(filepath.Join(home, "MANIFEST"))

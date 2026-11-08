@@ -113,16 +113,6 @@ func (cat catalog) wire() protocol.Catalog {
 	return w
 }
 
-func (cat catalog) firsts(t string) []string {
-	var f []string
-	for _, c := range cat[t] {
-		if c.kind == "first" {
-			f = append(f, c.Name)
-		}
-	}
-	return f
-}
-
 func (cat catalog) of(t, kind string) []command {
 	return slices.DeleteFunc(slices.Clone(cat[t]), func(c command) bool { return c.kind != kind })
 }

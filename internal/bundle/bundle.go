@@ -476,13 +476,20 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		}
 		return syncs, nil
 	}
-	if down != nil {
-		return nil, needsDocker("the cached bundle would change (the project changed)")
-	}
-	fmt.Fprintf(log, "saving %d images:\n  %s\n", len(saved), strings.Join(saved, "\n  "))
 	groups := map[string][]string{plat: nil} // (images.tar, if empty)
 	for _, img := range saved {
 		groups[plats[img]] = append(groups[plats[img]], img)
+	}
+	if down != nil {
+		// (Only the project's other files changed, its compose file or
+		// what it mounts: its images are out's.)
+		fmt.Fprintf(log, "note: Docker's daemon isn't reachable: the bundle keeps the cached bundle's images\n")
+		if err := copyImages(out, dir); err != nil {
+			return nil, err
+		}
+		groups = nil
+	} else {
+		fmt.Fprintf(log, "saving %d images:\n  %s\n", len(saved), strings.Join(saved, "\n  "))
 	}
 	for q, imgs := range groups {
 		a := strings.TrimPrefix(q, "linux/")
@@ -972,6 +979,35 @@ func Files(path string) map[string]string {
 			return nil
 		}
 		files[h.Name] = string(b)
+	}
+}
+
+// copyImages copies bundle path's images archives to dir.
+func copyImages(path, dir string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	r := tar.NewReader(f)
+	for {
+		h, err := r.Next()
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if !images(h.Name) {
+			continue
+		}
+		w, err := os.OpenFile(filepath.Join(dir, h.Name), os.O_CREATE|os.O_WRONLY|os.O_EXCL, h.FileInfo().Mode().Perm())
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, r)
+		if err = cmp.Or(err, w.Close()); err != nil {
+			return err
+		}
 	}
 }
 

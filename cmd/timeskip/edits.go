@@ -19,14 +19,14 @@ import (
 )
 
 // An edit copies file (a file, or a directory less what skip leaves out)
-// to target in service's containers, then takes action, as a develop.watch
-// sync rule does under docker compose watch. A directory
-// merges into what's there. deleted are paths under target whose files
-// were deleted on the host.
+// to target in service's containers before they start, as a develop.watch
+// sync rule does under docker compose watch. A directory merges into what's
+// there. deleted are paths under target whose files were deleted on the
+// host.
 type edit struct {
-	service, target, file, action string
-	skip                          func(string, bool) bool
-	deleted                       []string
+	service, target, file string
+	skip                  func(string, bool) bool
+	deleted               []string
 }
 
 // syncedEdits are the edits of the sync rules packed into bundle b (see
@@ -63,32 +63,29 @@ func syncedEdits(b string) []edit {
 	}
 	var in []edit
 	for i, y := range m.Rules {
-		in = append(in, edit{y.Service, y.Target, filepath.Join(d, "synced", strconv.Itoa(i)), y.Action, nil, nil})
+		in = append(in, edit{y.Service, y.Target, filepath.Join(d, "synced", strconv.Itoa(i)), nil, nil})
 	}
 	return in
 }
 
 // staged edits, in dir/inputs: copies of the files, with the manifests
-// replace, delete and sums (see cmd/guest). On Linux they become an ext4 image,
-// img, for the VMs' inputs drive.
+// replace and delete (see cmd/guest). On Linux they become an ext4 image,
+// img, for the VM's inputs drive.
 type staged struct {
 	dir, spec, img string
-	edits          []edit
-	paths          [][]string // each edit's paths in its containers
 }
 
 func stage(d string, edits []edit) *staged {
-	s := &staged{dir: filepath.Join(d, "inputs"), spec: "none", edits: edits}
+	s := &staged{dir: filepath.Join(d, "inputs"), spec: "none"}
 	check(os.MkdirAll(s.dir, 0o755))
-	var replace, del, sums strings.Builder
+	var replace, del strings.Builder
 	for i, e := range edits {
 		name := strconv.Itoa(i)
 		for _, p := range e.deleted {
-			fmt.Fprintf(&del, "%s\t%s\t%s\t%s\n", e.service, p, name, e.action)
+			fmt.Fprintf(&del, "%s\t%s\n", e.service, p)
 		}
 		// Only what the rule syncs is copied: not a whole .git or
 		// node_modules that it leaves out.
-		var paths []string
 		dst := filepath.Join(s.dir, name)
 		check(bundle.Walk(e.file, e.skip, func(p string, fi fs.FileInfo) {
 			if fi.Mode().Type()&^(fs.ModeDir|fs.ModeSymlink) != 0 {
@@ -96,25 +93,36 @@ func stage(d string, edits []edit) *staged {
 			}
 			rel, _ := filepath.Rel(e.file, p)
 			copyEntry(p, fi, filepath.Join(dst, rel))
-			if fi.Mode().IsRegular() {
-				fmt.Fprintf(&sums, "%s\t%s\n", filepath.ToSlash(filepath.Join(name, rel)), sum(p))
-			}
-			if !fi.IsDir() {
-				paths = append(paths, filepath.Join(e.target, rel))
-			}
 		}))
 		if _, err := os.Lstat(dst); err == nil { // (not if the file is gone or the rule leaves it out)
-			fmt.Fprintf(&replace, "%s\t%s\t%s\t%s\n", e.service, e.target, name, e.action)
+			fmt.Fprintf(&replace, "%s\t%s\t%s\n", e.service, e.target, name)
 		}
-		s.paths = append(s.paths, paths)
 	}
 	write(filepath.Join(s.dir, "replace"), replace.String())
 	write(filepath.Join(s.dir, "delete"), del.String())
-	write(filepath.Join(s.dir, "sums"), sums.String())
 	if replace.Len()+del.Len() > 0 {
 		s.seal(d)
 	}
 	return s
+}
+
+// syncKey identifies what edits give setup: each rule's service and
+// target, the paths, types, modes, link targets and contents of what it
+// syncs, and what it deletes.
+func syncKey(edits []edit) string {
+	h := sha256.New()
+	for _, e := range edits {
+		fmt.Fprintf(h, "%s %s %q\n", e.service, e.target, e.deleted)
+		check(bundle.Walk(e.file, e.skip, func(p string, fi fs.FileInfo) {
+			rel, _ := filepath.Rel(e.file, p)
+			l, _ := os.Readlink(p)
+			if fi.Mode().IsRegular() {
+				l = sum(p)
+			}
+			fmt.Fprintf(h, "%q %v %s\n", rel, fi.Mode(), l)
+		}))
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // sum is file p's SHA-256.
@@ -173,16 +181,4 @@ func (s *staged) seal(d string) {
 	fi, err := os.Stat(s.img)
 	check(err)
 	s.spec = fmt.Sprintf("blk:%d", fi.Size())
-}
-
-// templates are the test templates the edits add files to.
-func (s *staged) templates() (l []string) {
-	for _, paths := range s.paths {
-		for _, p := range paths {
-			if rel, ok := strings.CutPrefix(p, "/opt/antithesis/test/v1/"); ok && strings.Contains(rel, "/") {
-				l = append(l, strings.Split(rel, "/")[0])
-			}
-		}
-	}
-	return l
 }

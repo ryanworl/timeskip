@@ -28,22 +28,14 @@ func timeline(g protocol.Go) {
 	r := newRunner(tmpl)
 	reseed(g.Seed)
 	r.begin(g)
-	mountInputs(g.Inputs)
-	apply(r.ctx, readEdits())
 	cat, invalid, err := discover()
 	check(err)
-	// (A template the edits add may not be there yet.)
-	if !slices.Equal(cat.firsts(tmpl), g.Firsts) {
-		msg("EXIT", protocol.Exit{Kind: "replan", Catalog: cat.wire()})
-		return
-	}
 	for _, i := range invalid { // (as Antithesis's "Invalid commands found")
 		r.errors = append(r.errors, "invalid test command: "+i)
 	}
 	if tmpl != "" && len(cat[tmpl]) == 0 {
 		fail("no test template %s: no running container has commands in %s/%s/", tmpl, templates, tmpl)
 	}
-	syscall.Unmount("/inputs", 0) // (applied; and the VM can be saved now)
 	if f := g.First; f != "" {
 		i := slices.IndexFunc(cat[tmpl], func(c command) bool { return c.Name == f })
 		if rec := r.run(cat[tmpl][i]); rec.Exit != 0 || rec.Killed {

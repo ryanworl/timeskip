@@ -453,7 +453,7 @@ func TestBundles(t *testing.T) {
 			t.Errorf("exit %d, want 2 and a hint", rc)
 		}
 	})
-	t.Run("test -f follows edits as compose watch does", func(t *testing.T) {
+	t.Run("test -f sets up with edits as compose watch syncs them", func(t *testing.T) {
 		f := project(t, "edits")
 		dir := filepath.Dir(f)
 		// (And a service whose image the project doesn't build.)
@@ -476,13 +476,13 @@ func TestBundles(t *testing.T) {
 		if !slices.Contains(r.commands(0), "finally_tally.sh") {
 			t.Errorf("no finally_ command: %v", r.commands(0))
 		}
-		// A sync+restart rule: pong restarts with the new pong.sh.
+		// A synced file: the project is set up again, pong starting with
+		// the new pong.sh.
 		pong := filepath.Join(dir, "pong", "pong.sh")
 		edit(t, pong, "v1", "v2")
-		step("sync+restart", "pong 1 v2", "restarted pong")
-		// A file that can't stand in for the one it replaces fails the
-		// run before anything restarts: one no longer executable, or a
-		// binary for another architecture.
+		step("sync+restart", "pong 1 v2", "setting up")
+		// A file that can't stand in for the one it replaces fails setup:
+		// one no longer executable, or a binary for another architecture.
 		v2, _ := os.ReadFile(pong)
 		os.Chmod(pong, 0o644)
 		if rc, _ := timeskip(t, "edits-noexec", "test", f); rc != 125 {
@@ -520,12 +520,20 @@ func TestBundles(t *testing.T) {
 		if rc, _, out := run(t, "edits-setting", "test", f); rc != 0 || strings.Contains(out, "setting up") || strings.Contains(out, "saving") {
 			t.Errorf("exit %d, or set up or saved images again for a setting", rc)
 		}
-		// Without Docker's daemon: synced edits run on the bundle as it is,
-		// and an image that needs building fails the run.
+		// Without Docker's daemon: the project is set up again on the
+		// bundle as it is with the synced files, and an image that needs
+		// building fails the run.
 		t.Setenv("DOCKER_HOST", "unix://"+filepath.Join(work, "no-docker.sock"))
 		edit(t, pong, "v2", "v4")
-		if rc, out := timeskip(t, "edits-no-docker", "test", f); rc != 0 || !strings.Contains(out, "pong 1 v4") || !strings.Contains(out, "daemon isn't reachable") {
-			t.Errorf("exit %d; want 0, the synced pong.sh's answers and a note", rc)
+		if rc, out := timeskip(t, "edits-no-docker", "test", f); rc != 0 || !strings.Contains(out, "pong 1 v4") || !strings.Contains(out, "setting up") || !strings.Contains(out, "daemon isn't reachable") {
+			t.Errorf("exit %d; want 0, setup again, the synced pong.sh's answers and a note", rc)
+		}
+		// A change to the compose file alone writes the bundle again, with
+		// the cached bundle's images.
+		c, _ = os.ReadFile(f)
+		os.WriteFile(f, append(c, "    environment: {EDITED: \"1\"}\n"...), 0o644)
+		if rc, out := timeskip(t, "edits-no-docker-compose", "test", f); rc != 0 || !strings.Contains(out, "keeps the cached bundle's images") || !strings.Contains(out, "setting up") {
+			t.Errorf("exit %d; want 0, a bundle written again and setup again", rc)
 		}
 		edit(t, filepath.Join(dir, "pong", "Dockerfile"), "RUN echo v3", "RUN echo v5")
 		if rc, out := timeskip(t, "edits-no-docker-build", "test", f); rc != 2 || !strings.Contains(out, "needs building") {
@@ -539,10 +547,10 @@ func TestBundles(t *testing.T) {
 		os.Mkdir(extra, 0o755)
 		os.WriteFile(filepath.Join(extra, "helper_lib.sh"), nil, 0o644)
 		// With only a helper_ file, it isn't a template.
-		if rc, out := timeskip(t, "added-helper", "test", f, "--template", "extra"); rc != 125 || !strings.Contains(out, "no test template extra") {
-			t.Errorf("exit %d, want 125 and no test template extra", rc)
+		if rc, out := timeskip(t, "added-helper", "test", f, "--template", "extra"); rc != 2 || !strings.Contains(out, "no test template extra") {
+			t.Errorf("exit %d, want 2 and no test template extra", rc)
 		}
-		// Its first_ command, which the host can't know of, runs first.
+		// Its first_ command runs first.
 		os.WriteFile(filepath.Join(extra, "first_hello.sh"), []byte("#!/bin/sh\necho hello\n"), 0o755)
 		os.WriteFile(filepath.Join(extra, "singleton_driver_hi.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755)
 		rc, r, _ := run(t, "added", "test", f, "--template", "extra")

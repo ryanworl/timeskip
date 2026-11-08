@@ -599,6 +599,7 @@ type container struct {
 		PidMode     string
 	}
 	Mounts          []mount
+	GraphDriver     struct{ Data map[string]string }
 	NetworkSettings struct {
 		Networks map[string]struct{ IPAddress string }
 	}

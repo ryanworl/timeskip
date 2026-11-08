@@ -66,7 +66,7 @@ type run struct {
 	// ContainerLogs are its containers' logs, if it failed.
 	ContainerLogs string `json:"container_logs,omitempty"`
 	i             int
-	setup         bool // its edits or new images couldn't be applied
+	setup         bool // it failed before its first_ command started
 	from          *branchPoint
 }
 
@@ -97,18 +97,10 @@ func (p *plan) choose(cat protocol.Catalog) {
 	}
 }
 
-// cmdTest runs the timelines from setup with edits.
-func cmdTest(setup *checkpoint, edits []edit, o options) {
+// cmdTest runs the timelines from setup.
+func cmdTest(setup *checkpoint, o options) {
 	runs := tempDir()
-	in := stage(runs, edits)
-	// (A template the edits add has, as far as the host knows, no first_
-	// commands; the guest replans the timeline if it has.)
-	cat := maps.Clone(setup.meta.Catalog)
-	for _, t := range in.templates() {
-		if _, ok := cat[t]; !ok {
-			cat[t] = nil
-		}
-	}
+	cat := setup.meta.Catalog
 	tmpls := o.templates
 	var replay *branchPoint
 	if o.branch != "" {
@@ -168,51 +160,40 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 			if x != nil {
 				p.from = x.start(p.tmpl)
 			}
-			for {
-				r, newCat := timeline(setup, p, in, o, x, runs, len(plans) == 1, enough)
-				if r.NotRun {
-					if x != nil && p.from != nil {
-						x.done(p.from, false)
-					}
-					os.RemoveAll(filepath.Dir(r.Log))
-					notRun()
-					return
+			r := timeline(setup, p, o, x, runs, len(plans) == 1, enough)
+			if r.NotRun {
+				if x != nil && p.from != nil {
+					x.done(p.from, false)
 				}
-				if newCat == nil {
-					if x != nil && p.from != nil {
-						x.done(p.from, !r.Pass)
-					}
-					if r.Pass { // (a log that isn't kept: see below)
-						os.RemoveAll(filepath.Dir(r.Log))
-					}
-					if r.Pass || len(plans) == 1 {
-						r.Log = ""
-					}
-					mu.Lock()
-					if o.maxFailures > 0 && countsAsFailure(r, o) {
-						if failures++; failures == o.maxFailures {
-							stop()
-						}
-					}
-					mu.Unlock()
-					results[i] = r
-					if len(plans) > 1 { // (each timeline's line as it ends, and how many have)
-						mu.Lock()
-						ended++
-						status := "ok"
-						if !r.Pass {
-							status = "FAIL"
-							failed++
-						}
-						printTimeline(r, status, o, fmt.Sprintf("; %d of %d done, %d failed", ended, len(plans), failed))
-						mu.Unlock()
-					}
-					return
+				os.RemoveAll(filepath.Dir(r.Log))
+				notRun()
+				return
+			}
+			if x != nil && p.from != nil {
+				x.done(p.from, !r.Pass)
+			}
+			if r.Pass { // (a log that isn't kept: see below)
+				os.RemoveAll(filepath.Dir(r.Log))
+			}
+			if r.Pass || len(plans) == 1 {
+				r.Log = ""
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if o.maxFailures > 0 && countsAsFailure(r, o) {
+				if failures++; failures == o.maxFailures {
+					stop()
 				}
-				mu.Lock()
-				cat = newCat
-				p.choose(cat)
-				mu.Unlock()
+			}
+			results[i] = r
+			if len(plans) > 1 { // (each timeline's line as it ends, and how many have)
+				ended++
+				status := "ok"
+				if !r.Pass {
+					status = "FAIL"
+					failed++
+				}
+				printTimeline(r, status, o, fmt.Sprintf("; %d of %d done, %d failed", ended, len(plans), failed))
 			}
 		})
 	}
@@ -264,8 +245,7 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 }
 
 // countsAsFailure is whether r counts toward --max-failures: it failed, and
-// with first:N, in its first_ command or before it (its edits or new images
-// couldn't be applied).
+// with first:N, in its first_ command or before it.
 func countsAsFailure(r run, o options) bool {
 	return !r.Pass && (!o.firstFailures || r.setup || slices.ContainsFunc(r.Commands, func(c protocol.Record) bool {
 		return c.Name == r.First && c.Exit != 0 && !c.Killed
@@ -273,10 +253,9 @@ func countsAsFailure(r run, o options) bool {
 }
 
 // timeline runs one timeline from setup, or from p's branch point.
-// Exploring, x saves branch points from it. A new catalog comes back if the
-// edits changed the template's first_ commands. Once enough is closed, it
-// stops the VM, with a result that's NotRun.
-func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, runs string, echo bool, enough chan struct{}) (run, protocol.Catalog) {
+// Exploring, x saves branch points from it. Once enough is closed, it stops
+// the VM, with a result that's NotRun.
+func timeline(setup *checkpoint, p *plan, o options, x *explorer, runs string, echo bool, enough chan struct{}) run {
 	dir := filepath.Join(runs, fmt.Sprintf("%s-%d", p.tmpl, p.i))
 	os.RemoveAll(dir)
 	from := setup
@@ -287,7 +266,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 	data := filepath.Join(dir, "disk")
 	clone(from.file("disk"), data)
 	defer os.Remove(data) // (once the VM is gone: a run may have thousands)
-	v := start(dir, setup.meta.Nonce, nil, in.dir, from, data, in.img, x != nil)
+	v := start(dir, setup.meta.Nonce, nil, setup.file("inputs"), from, data, "", x != nil)
 	defer v.kill()
 	v.cut = enough
 	if echo {
@@ -300,8 +279,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 		r.Branch, r.from = &ref, p.from
 		v.send("BRANCH", fmt.Sprintf("seed=%d", p.seed))
 	} else {
-		v.send("GO", protocol.Go{Skip: o.skip, Seed: p.seed, Template: p.tmpl, First: p.first, Firsts: p.firsts, Drivers: o.drivers,
-			Timeout: o.timeout, Inputs: in.spec,
+		v.send("GO", protocol.Go{Skip: o.skip, Seed: p.seed, Template: p.tmpl, First: p.first, Drivers: o.drivers, Timeout: o.timeout,
 			Faults: map[bool]float64{true: o.faultGap}[o.faults != ""], Level: o.faults, Disk: o.diskFaults, Profile: o.profile,
 			Symbols: wantSymbols.Load(), Explore: x != nil}.String())
 	}
@@ -317,7 +295,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 		switch l.verb {
 		case "CUT":
 			r.NotRun = true
-			return r, nil
+			return r
 		case "EDGES": // (a replay's too, from a branch point saved exploring: x is nil then)
 			var e protocol.Edges
 			json.Unmarshal([]byte(l.body), &e)
@@ -325,7 +303,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 				if news += x.news(e); news > 0 && e.AtMs-lastSave >= spacing {
 					if b := x.reserve(p, setup, e, news); b != nil {
 						t := time.Now()
-						x.save(v, b, data, in.img, base) // (and sends NOTED)
+						x.save(v, b, data, base) // (and sends NOTED)
 						paused += time.Since(t)
 						r.Saves, r.SaveS = r.Saves+1, r.SaveS+time.Since(t).Seconds()
 						news, lastSave, saved = 0, e.AtMs, append(saved, b)
@@ -338,8 +316,6 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 		case "EXIT":
 			e := exitOf(l)
 			switch e.Kind {
-			case "replan":
-				return r, e.Catalog
 			case "timeline":
 				r.Result = *e.Result
 				if len(r.Symbols) > 0 && len(r.Symbols) == len(r.Coverage) {
@@ -359,7 +335,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 				if x != nil && !r.Pass {
 					x.withdraw(saved, cmp.Or(r.FailedMs, r.GuestMs))
 				}
-				return r, nil
+				return r
 			case "setup":
 				r.Errors, r.setup = append(r.Errors, "setup failed: "+e.Error), true
 				if containerLogs(data, filepath.Join(dir, "containers.log")) {
@@ -371,7 +347,7 @@ func timeline(setup *checkpoint, p *plan, in *staged, o options, x *explorer, ru
 		default: // EXITED (the VMM's failure fails only this timeline)
 			r.Errors = append(r.Errors, cmp.Or(l.body, "the VM stopped without a result"))
 		}
-		return r, nil
+		return r
 	}
 }
 

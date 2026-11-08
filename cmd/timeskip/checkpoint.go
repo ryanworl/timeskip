@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -123,11 +124,12 @@ func checkKit(dir, manifest string) error {
 	return nil
 }
 
-// setupCheckpoint returns bundle b's setup checkpoint (b is, or will be, at
-// origin), saving it first if there isn't one, or why setup failed. It holds
-// the checkpoint (a shared lock) until this process exits.
-func setupCheckpoint(b, origin string) (*checkpoint, error) {
-	c, err := saved(hash(bundle.ID(b), kitID(), memMB, slackArg()), func(c *checkpoint) error {
+// setupCheckpoint returns the setup checkpoint of bundle b (b is, or will
+// be, at origin) with edits applied before its containers start, saving it
+// first if there isn't one, or why setup failed. It holds the checkpoint (a
+// shared lock) until this process exits.
+func setupCheckpoint(b, origin string, edits []edit) (*checkpoint, error) {
+	c, err := saved(hash(bundle.ID(b), kitID(), memMB, slackArg(), syncKey(edits)), func(c *checkpoint) error {
 		// (A project's bundle in the cache leaves out the images it doesn't
 		// build: they're loaded in an images checkpoint, kept for its next
 		// builds.)
@@ -144,7 +146,7 @@ func setupCheckpoint(b, origin string) (*checkpoint, error) {
 				return err
 			}
 		}
-		return build(c, b, origin, from)
+		return build(c, b, origin, from, edits)
 	})
 	if err != nil {
 		return nil, err
@@ -182,7 +184,7 @@ func imagesCheckpoint(images []string) (*checkpoint, error) {
 		fmt.Fprintf(os.Stderr, "timeskip: bundling %s: %v\n", strings.Join(images, " "), err)
 		return nil, err
 	}
-	return setupCheckpoint(mine, b)
+	return setupCheckpoint(mine, b, nil)
 }
 
 // baseCheckpoint returns the base checkpoint, which every bundle's setup
@@ -372,16 +374,16 @@ func buildBase(c *checkpoint) {
 		showTail(v.file("console.log"), 40)
 		die("the VM didn't start (%s)", l.verb)
 	}
-	v.save(c.dir, c.file("disk"), "", c.placeholder(), false)
+	v.save(c.dir, c.file("disk"), c.placeholder(), false)
 	go v.kill() // (waited for at exit)
 	c.meta = meta{Nonce: n, Kit: kitID()}
 }
 
 // build saves bundle b's setup checkpoint (b is, or will be, at origin):
 // a VM restored from checkpoint from (the base, or an images checkpoint),
-// given the bundle, once it reports READY. If setup fails, it shows why and
-// returns the error.
-func build(c *checkpoint, b, origin string, from *checkpoint) error {
+// given the bundle and edits, once it reports READY. If setup fails, it
+// shows why and returns the error.
+func build(c *checkpoint, b, origin string, from *checkpoint, edits []edit) error {
 	if os.Link(b, c.bundle()) != nil {
 		clone(b, c.bundle())
 	}
@@ -395,12 +397,11 @@ func build(c *checkpoint, b, origin string, from *checkpoint) error {
 	fmt.Fprintf(os.Stderr, "timeskip: setting up %s (a checkpoint for each version of a bundle)\n", filepath.Base(origin))
 	clone(from.file("disk"), c.file("disk"))
 	go writeOut(c.file("disk"))
-	if darwin {
-		check(os.MkdirAll(c.file("inputs"), 0o755))
-	} else {
+	if !darwin {
 		sparse(c.placeholder(), 1<<20)
 	}
-	v := start(c.file("vm"), from.meta.Nonce, nil, c.file("inputs"), from, c.file("disk"), c.placeholder(), true)
+	in := stage(c.dir, edits) // (in the share, c's inputs, on macOS)
+	v := start(c.file("vm"), from.meta.Nonce, nil, in.dir, from, c.file("disk"), cmp.Or(in.img, c.placeholder()), true)
 	// (On Linux the save writes the pages written since the restore over a
 	// copy of the base's memory, made meanwhile.)
 	copied := make(chan struct{})
@@ -412,12 +413,12 @@ func build(c *checkpoint, b, origin string, from *checkpoint) error {
 	}()
 	if darwin {
 		check(os.Link(c.bundle(), c.file("inputs/bundle.tsb")))
-		v.send("SETUP", "bundle=virtiofs")
+		v.send("SETUP", "bundle=virtiofs inputs="+in.spec)
 	} else {
 		st, err := os.Stat(c.bundle())
 		check(err)
 		v.check(v.api("PATCH", "/drives/d0", map[string]string{"drive_id": "d0", "path_on_host": c.bundle()}))
-		v.send("SETUP", fmt.Sprintf("bundle=blk:%d", st.Size()))
+		v.send("SETUP", fmt.Sprintf("bundle=blk:%d inputs=%s", st.Size(), in.spec))
 	}
 	l := v.next()
 	log := v.file("console.log")
@@ -441,9 +442,15 @@ func build(c *checkpoint, b, origin string, from *checkpoint) error {
 	var ready protocol.Ready
 	check(json.Unmarshal([]byte(l.body), &ready))
 	<-copied
-	v.save(c.dir, c.file("disk"), "", c.placeholder(), false)
+	if in.img != "" { // (its timelines get the placeholder)
+		v.check(v.api("PATCH", "/drives/d2", map[string]string{"drive_id": "d2", "path_on_host": c.placeholder()}))
+	}
+	v.save(c.dir, c.file("disk"), c.placeholder(), false)
 	go v.kill()
-	os.Remove(c.file("inputs/bundle.tsb"))
+	// (Its share, empty, is its timelines'.)
+	check(os.RemoveAll(in.dir))
+	os.Remove(in.img)
+	check(os.Mkdir(in.dir, 0o755))
 	c.meta = meta{Nonce: from.meta.Nonce, Catalog: ready.Catalog, Bundle: origin, Kit: from.meta.Kit}
 	return nil
 }

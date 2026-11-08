@@ -2,10 +2,10 @@
 
 // Command guest is timeskip's guest agent, /timeskip-guest in the VM, run by
 // /init once dockerd is up. It reports BASE (for the base checkpoint), and on
-// SETUP starts the bundle's Compose project, waits for the project's
-// setup_complete message, reports READY with the project's test
-// templates, and on GO runs a timeline: the host's edits applied, then test
-// commands scheduled as Antithesis's Test Composer schedules them (see
+// SETUP starts the bundle's Compose project, with the host's edits applied,
+// waits for the project's setup_complete message, reports READY with the
+// project's test templates, and on GO runs a timeline: test commands
+// scheduled as Antithesis's Test Composer schedules them (see
 // docs/reference.md for the protocol).
 package main
 
@@ -149,7 +149,8 @@ func main() {
 			timeline(protocol.ParseGo(body))
 			return
 		}
-		setup(protocol.Fields(body)["bundle"])
+		f := protocol.Fields(body)
+		setup(f["bundle"], f["inputs"])
 	}
 }
 
@@ -176,8 +177,9 @@ func base() {
 // setup, given SETUP in a VM restored from the base checkpoint or another
 // bundle's (an images checkpoint, whose images it keeps), loads the bundle,
 // starts the project, waits for its setup_complete and an idle moment, and
-// reports READY, for the host to save the VM. bundle is SETUP's bundle=.
-func setup(bundle string) {
+// reports READY, for the host to save the VM. bundle and inputs are
+// SETUP's bundle= and inputs=.
+func setup(bundle, inputs string) {
 	setSkip(true)
 	logsT0 = uptime()
 	// (Zeroing freed pages, as from boot, so that the save holds only live
@@ -187,9 +189,7 @@ func setup(bundle string) {
 	check(os.RemoveAll(bundled))
 	check(os.MkdirAll(bundled, 0o755))
 	check(untarFile(bundleFile(bundle), bundled))
-	if bundle == "virtiofs" {
-		syscall.Unmount("/inputs", 0)
-	}
+	mountInputs(inputs)
 	system, err := writeOverride()
 	check(err)
 	watchExits()
@@ -202,6 +202,7 @@ func setup(bundle string) {
 		// see makeDisks.)
 		check(composeCtx(ctx, "create", "--quiet-pull"))
 		check(makeDisks())
+		apply(readEdits())
 		check(composeCtx(ctx, "up", "-d", "--quiet-pull"))
 		cancel()
 		// Poll every 50 ms, every second after 10 s: polls are wake-ups.
@@ -215,9 +216,9 @@ func setup(bundle string) {
 		}
 		say("setup complete")
 	}
+	syscall.Unmount("/inputs", 0) // (the VM can be saved now)
 	idle()
 	checkExits()
-	sumTargets()
 	cat, _, err := discover()
 	check(err)
 	countSetup()
@@ -374,26 +375,6 @@ func sdkLines() [][]byte {
 func checkExits() {
 	if l := exitsSince(0); len(l) > 0 {
 		fail("%s during setup", strings.Join(l, "; "))
-	}
-}
-
-// started waits until every container is past starting: created ones
-// running, and ones with a healthcheck past its start period.
-func started() error {
-	for t := uptime(); ; {
-		cs, err := containers("")
-		if err != nil {
-			return err
-		}
-		if !slices.ContainsFunc(cs, func(c container) bool {
-			return c.State.Status == "created" || c.State.Health != nil && c.State.Health.Status == "starting"
-		}) {
-			return nil
-		}
-		if uptime()-t > setupMax {
-			return fmt.Errorf("services not up after %v", setupMax)
-		}
-		time.Sleep(map[bool]time.Duration{true: 50 * time.Millisecond, false: time.Second}[uptime()-t < 10*time.Second])
 	}
 }
 

@@ -54,10 +54,8 @@ type Go struct {
 	Seed     uint64 // its schedule's, and the kernel's random number generator's, reseeded with it
 	Template string
 	First    string   // the template's first_ command to run (none if empty)
-	Firsts   []string // the template's first_ commands, as the host found them
 	Drivers  int      // driver commands to launch, when not a singleton_driver
 	Timeout  int      // guest seconds before the timeline is stopped
-	Inputs   string   // where the edits are: none, virtiofs or blk:SIZE (the third drive)
 	Faults   float64  // inject faults while the drivers run, at most a gap apart that each timeline draws around Faults seconds (see the guest's inject); 0: none
 	Level    string   // which faults, by Antithesis's fault tolerance level: legacy, resilient or high_availability
 	Disk     []string // with Faults, disk faults too, of these kinds (fail, full, power), which no fault tolerance level makes
@@ -70,16 +68,16 @@ type Go struct {
 }
 
 func (g Go) String() string {
-	return fmt.Sprintf("skip=%d seed=%d template=%s first=%s firsts=%s drivers=%d timeout=%d inputs=%s faults=%g level=%s disk=%s profile=%d symbols=%d explore=%d",
-		bit(g.Skip), g.Seed, url.QueryEscape(g.Template), url.QueryEscape(g.First), list(g.Firsts), g.Drivers, g.Timeout,
-		g.Inputs, g.Faults, g.Level, list(g.Disk), bit(g.Profile), bit(g.Symbols), bit(g.Explore))
+	return fmt.Sprintf("skip=%d seed=%d template=%s first=%s drivers=%d timeout=%d faults=%g level=%s disk=%s profile=%d symbols=%d explore=%d",
+		bit(g.Skip), g.Seed, url.QueryEscape(g.Template), url.QueryEscape(g.First), g.Drivers, g.Timeout,
+		g.Faults, g.Level, list(g.Disk), bit(g.Profile), bit(g.Symbols), bit(g.Explore))
 }
 
 // ParseGo is the Go in a GO line's body.
 func ParseGo(body string) Go {
 	kv := Fields(body)
-	g := Go{Skip: kv["skip"] == "1", Template: unescape(kv["template"]), First: unescape(kv["first"]), Firsts: unlist(kv["firsts"]),
-		Inputs: kv["inputs"], Level: kv["level"], Disk: unlist(kv["disk"]), Profile: kv["profile"] == "1", Symbols: kv["symbols"] == "1", Explore: kv["explore"] == "1"}
+	g := Go{Skip: kv["skip"] == "1", Template: unescape(kv["template"]), First: unescape(kv["first"]),
+		Level: kv["level"], Disk: unlist(kv["disk"]), Profile: kv["profile"] == "1", Symbols: kv["symbols"] == "1", Explore: kv["explore"] == "1"}
 	g.Seed, _ = strconv.ParseUint(kv["seed"], 10, 64)
 	g.Drivers, _ = strconv.Atoi(kv["drivers"])
 	g.Timeout, _ = strconv.Atoi(kv["timeout"])
@@ -145,10 +143,9 @@ type Ready struct {
 
 // Exit is EXIT's body.
 type Exit struct {
-	Kind    string  `json:"kind"`              // timeline, setup or replan
-	Error   string  `json:"error,omitempty"`   // (setup) what failed
-	Catalog Catalog `json:"catalog,omitempty"` // (replan) the test commands after the edits
-	*Result         // (timeline)
+	Kind    string `json:"kind"`            // timeline or setup
+	Error   string `json:"error,omitempty"` // (setup) what failed
+	*Result        // (timeline)
 }
 
 // A Result is a timeline's.

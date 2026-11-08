@@ -318,14 +318,14 @@ func (v *vm) send(verb, fields string) {
 
 // save pauses the VM and saves it to dir: state (and on Linux mem), and
 // disk, a copy of its data disk, data, taken while it's paused. The saved
-// VM refers to dir/disk, and on Linux to placeholder for the inputs drive
-// (the running VM has img, if any). On Linux, a booted VM saves the memory
+// VM refers to dir/disk, and on Linux to placeholder for the inputs drive.
+// On Linux, a booted VM saves the memory
 // it has touched to dir/mem; a restored one (tracking its writes) saves only
 // the pages written since its restore (or its last save), over dir/mem, a
 // copy of the memory file it was restored from (or last saved); or with
 // diff, to dir/mem.diff, for the caller to put over such a copy (see
 // explorer.save).
-func (v *vm) save(dir, data, img, placeholder string, diff bool) {
+func (v *vm) save(dir, data, placeholder string, diff bool) {
 	disk := filepath.Join(dir, "disk")
 	if darwin {
 		fmt.Fprintf(v.stdin, "@save %s\n", filepath.Join(dir, "state"))
@@ -352,7 +352,7 @@ func (v *vm) save(dir, data, img, placeholder string, diff bool) {
 		clone(data, disk)
 		go writeOut(disk)
 		v.drives(disk, placeholder)
-		defer v.drives(data, cmp.Or(img, placeholder))
+		defer v.drives(data, placeholder)
 	}
 	// (Unsynced: a crash leaves a checkpoint without its "done" file, which
 	// is then made again. publish syncs it.)
