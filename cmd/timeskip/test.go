@@ -136,6 +136,7 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 	// The timelines, up to -j at a time.
 	results := make([]run, len(plans))
 	var mu sync.Mutex
+	ended, failed := 0, 0 // (timelines that ended, and failed)
 	var wg sync.WaitGroup
 	jobs := make(chan struct{}, o.jobs)
 	// (--max-failures: once enough timelines failed, the others don't
@@ -187,6 +188,17 @@ func cmdTest(setup *checkpoint, edits []edit, o options) {
 					}
 					mu.Unlock()
 					results[i] = r
+					if len(plans) > 1 { // (each timeline's line as it ends, and how many have)
+						mu.Lock()
+						ended++
+						status := "ok"
+						if !r.Pass {
+							status = "FAIL"
+							failed++
+						}
+						printTimeline(r, status, o, fmt.Sprintf("; %d of %d done, %d failed", ended, len(plans), failed))
+						mu.Unlock()
+					}
 					return
 				}
 				mu.Lock()

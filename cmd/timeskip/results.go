@@ -147,30 +147,7 @@ func report(runs []run, o options) bool {
 		} else {
 			passed++
 		}
-		faults := ""
-		if o.faults != "" {
-			faults = fmt.Sprintf(", %d faults", len(r.Faults))
-			if r.FaultMix == "no node faults" {
-				faults += " (no node faults)"
-			}
-		}
-		from := r.From
-		if r.Branch != nil {
-			from += ": " + r.Branch.String()
-		}
-		fmt.Fprintf(os.Stderr, "timeline %s#%d seed=%d %-4s %d commands%s, %.1f s of guest time in %.2f s (from %s)\n",
-			r.Template, r.i, r.Seed, status, len(r.Commands), faults, float64(r.GuestMs)/1000, r.Wall, from)
-		for _, e := range r.Errors {
-			fmt.Fprintf(os.Stderr, "  %s\n", e)
-		}
-		if r.TimedOut {
-			fmt.Fprintf(os.Stderr, "  ran out of time (timeout: %d guest seconds); what still ran was killed\n", o.timeout)
-		}
-		for _, c := range r.Commands {
-			if c.Exit != 0 && !c.Killed {
-				fmt.Fprintf(os.Stderr, "  %s exited %d\n", c.Name, c.Exit)
-			}
-		}
+		printTimeline(r, status, o, "")
 	}
 	mostCPU(runs)
 	if o.explore {
@@ -225,6 +202,36 @@ func report(runs []run, o options) bool {
 	}
 	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed%s, %d of %d properties failed\n", passed, len(runs), stopped, failed, len(props))
 	return ok
+}
+
+// printTimeline prints a timeline's line (status ok or FAIL) and what went
+// wrong in it; count, if any, ends the line (as each timeline ends: see
+// cmdTest).
+func printTimeline(r run, status string, o options, count string) {
+	faults := ""
+	if o.faults != "" {
+		faults = fmt.Sprintf(", %d faults", len(r.Faults))
+		if r.FaultMix == "no node faults" {
+			faults += " (no node faults)"
+		}
+	}
+	from := r.From
+	if r.Branch != nil {
+		from += ": " + r.Branch.String()
+	}
+	fmt.Fprintf(os.Stderr, "timeline %s#%d seed=%d %-4s %d commands%s, %.1f s of guest time in %.2f s (from %s)%s\n",
+		r.Template, r.i, r.Seed, status, len(r.Commands), faults, float64(r.GuestMs)/1000, r.Wall, from, count)
+	for _, e := range r.Errors {
+		fmt.Fprintf(os.Stderr, "  %s\n", e)
+	}
+	if r.TimedOut {
+		fmt.Fprintf(os.Stderr, "  ran out of time (timeout: %d guest seconds); what still ran was killed\n", o.timeout)
+	}
+	for _, c := range r.Commands {
+		if c.Exit != 0 && !c.Killed {
+			fmt.Fprintf(os.Stderr, "  %s exited %d\n", c.Name, c.Exit)
+		}
+	}
 }
 
 // mostCPU prints where the guests' CPU time went, summed over the runs: the
