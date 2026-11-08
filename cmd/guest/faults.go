@@ -803,7 +803,7 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 			return err
 		}
 	case 1:
-		f.Kind, f.Detail = "stop", "SIGTERM, then SIGKILL after 10 s"
+		f.Kind = "stop" // (its detail names the signals of those it took: below)
 		do = func(c container) error { return call("POST", "/containers/"+c.ID+"/stop?t=10", nil, nil) }
 	default:
 		f.Kind, f.Detail = "kill", "SIGKILL"
@@ -898,6 +898,9 @@ func (in *injector) node(rng *rand.Rand, start func()) (*protocol.Fault, func() 
 		return nil, nil, nil
 	}
 	f.Targets = [][]string{names(ok)}
+	if f.Kind == "stop" {
+		f.Detail += stopSignals(ok) + ", then SIGKILL after 10 s"
+	}
 	if power {
 		err = errors.Join(err, in.powerOff(ok))
 		for _, c := range ok {
@@ -1038,6 +1041,26 @@ func netOwner(c container, byID map[string]container) (container, int) {
 		}
 		c = byID[id]
 	}
+}
+
+// stopSignals names the signals a stop sends the containers first, each
+// one's own stop signal (see stopSignal), in their order: "SIGTERM", or
+// "SIGQUIT or SIGTERM".
+func stopSignals(cs []container) string {
+	var l []string
+	for _, c := range cs {
+		n := "SIGTERM"
+		if s := c.Config.StopSignal; s != "" {
+			n = "SIG" + strings.TrimPrefix(strings.ToUpper(s), "SIG")
+			if _, err := strconv.Atoi(s); err == nil {
+				n = "signal " + s
+			}
+		}
+		if !slices.Contains(l, n) {
+			l = append(l, n)
+		}
+	}
+	return strings.Join(l, " or ")
 }
 
 // names are the containers' names.

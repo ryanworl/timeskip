@@ -849,6 +849,32 @@ func TestProtocol(t *testing.T) {
 					t.Errorf("no stop faults")
 				}
 			}
+			// faultstopsignal.yaml: a stop's detail names each target's own
+			// stop signal, not always SIGTERM.
+			if name == "faultstopsignal" {
+				sigs := map[string]string{"catcher": "SIGINT", "initcatcher": "SIGINT", "hostcatcher": "SIGINT", "waiter": "SIGTERM", "quitter": "SIGUSR1", "dumper": "SIGQUIT", "segfaulter": "SIGSEGV"}
+				stops := 0
+				for _, tl := range r.Timelines {
+					for _, f := range tl.Faults {
+						if f.Kind != "stop" {
+							continue
+						}
+						stops++
+						for _, l := range f.Targets {
+							for _, c := range l {
+								for svc, sig := range sigs {
+									if strings.Contains(c, "-"+svc+"-") && !strings.Contains(f.Detail, sig) {
+										t.Errorf("timeline %d: a stop of %s says %q, not its %s", tl.Seed, c, f.Detail, sig)
+									}
+								}
+							}
+						}
+					}
+				}
+				if stops == 0 {
+					t.Errorf("no stop faults")
+				}
+			}
 			// maxfailures.yaml: first:1 stops the first_spin once the
 			// first_fail failed; a driver's failure doesn't count toward
 			// first:N; and after N failures no timeline starts.
