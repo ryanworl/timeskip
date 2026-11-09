@@ -370,26 +370,36 @@ func saveMemory(_ dst: String) {
 	// restored), 1 written, 2 made a hole. Booted, a page the guest touched
 	// that isn't zero is written; restored, one in the mapping's own
 	// (anonymous) copy, in memory or compressed, is written or, if zero, made
-	// a hole.
-	let fate: [Int] = (0..<n).map { i in
-		let f = Int32(info[i])
-		let touched = memFile != nil ? f & (MINCORE_COPIED | MINCORE_ANONYMOUS) != 0 : f & (MINCORE_INCORE | MINCORE_PAGED_OUT) != 0
-		if !touched { return 0 }
-		if memcmp(ram + i * page, zero, page) != 0 { return 1 }
-		return memFile != nil ? 2 : 0
-	}
-	var i = 0
-	while i < n {
-		var j = i + 1
-		while j < n && fate[j] == fate[i] && (fate[i] != 1 || j - i < 256) { j += 1 }
-		if fate[i] == 1, pwrite(fd, ram + i * page, (j - i) * page, off_t(i * page)) != (j - i) * page {
-			fail("write \(dst): \(String(cString: strerror(errno)))")
+	// a hole. A chunk at a time, each then unmapped from hvrun's own page
+	// tables (protected and unprotected), as macOS counts a page that both
+	// the guest and hvrun map twice in the footprint: reading all of memory
+	// would show it as twice its size.
+	let chunk = 4096
+	for c in stride(from: 0, to: n, by: chunk) {
+		let e = min(c + chunk, n)
+		let fate: [Int] = (c..<e).map { i in
+			let f = Int32(info[i])
+			let touched = memFile != nil ? f & (MINCORE_COPIED | MINCORE_ANONYMOUS) != 0 : f & (MINCORE_INCORE | MINCORE_PAGED_OUT) != 0
+			if !touched { return 0 }
+			if memcmp(ram + i * page, zero, page) != 0 { return 1 }
+			return memFile != nil ? 2 : 0
 		}
-		if fate[i] == 2 {
-			var h = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: off_t(i * page), fp_length: off_t((j - i) * page))
-			if fcntl(fd, F_PUNCHHOLE, &h) != 0 { fail("punching a hole in \(dst): \(String(cString: strerror(errno)))") }
+		var i = c
+		while i < e {
+			let f = fate[i - c]
+			var j = i + 1
+			while j < e && fate[j - c] == f && (f != 1 || j - i < 256) { j += 1 }
+			if f == 1, pwrite(fd, ram + i * page, (j - i) * page, off_t(i * page)) != (j - i) * page {
+				fail("write \(dst): \(String(cString: strerror(errno)))")
+			}
+			if f == 2 {
+				var h = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: off_t(i * page), fp_length: off_t((j - i) * page))
+				if fcntl(fd, F_PUNCHHOLE, &h) != 0 { fail("punching a hole in \(dst): \(String(cString: strerror(errno)))") }
+			}
+			i = j
 		}
-		i = j
+		let p = ram + c * page, len = (e - c) * page
+		if mprotect(p, len, PROT_NONE) != 0 || mprotect(p, len, PROT_READ | PROT_WRITE) != 0 { fail("mprotect: \(String(cString: strerror(errno)))") }
 	}
 }
 
