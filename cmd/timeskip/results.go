@@ -187,7 +187,10 @@ func report(runs []run, o options) bool {
 	for i := range runs {
 		runs[i].Coverage, runs[i].Symbols = nil, nil
 	}
-	failed, unjudged := 0, 0
+	// (A failed property no timeline broke wasn't reached: a Sometimes
+	// assertion never true, a must_hit one never reached. One a timeline
+	// broke was violated.)
+	violated, unreached, unjudged := 0, 0, 0
 	for _, p := range props {
 		status, why := "ok  ", ""
 		if p.Unjudged {
@@ -195,7 +198,11 @@ func report(runs []run, o options) bool {
 			unjudged++
 		} else if !p.Pass {
 			status, ok = "FAIL", false
-			failed++
+			if p.first == nil && len(p.Failing) == 0 {
+				unreached++
+			} else {
+				violated++
+			}
 		}
 		fmt.Fprintf(os.Stderr, "%s %-20s %s (%d of %d true%s)\n", status, p.Type, p.Name, p.True, p.Hits, why)
 		if b := p.first; b != nil && b.Branch != nil {
@@ -220,7 +227,7 @@ func report(runs []run, o options) bool {
 	if notRun > 0 {
 		stopped = fmt.Sprintf(", %d not run", notRun)
 	}
-	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed%s, %d of %d properties failed%s\n", passed, len(runs), stopped, failed, len(props),
+	fmt.Fprintf(os.Stderr, "timeskip: %d of %d timelines passed%s; %d of %d properties violated, %d not reached%s\n", passed, len(runs), stopped, violated, len(props), unreached,
 		map[bool]string{true: fmt.Sprintf(" (%d not judged by a replay)", unjudged)}[unjudged > 0])
 	return ok
 }

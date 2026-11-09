@@ -1178,7 +1178,7 @@ func TestCleanup(t *testing.T) {
 		rc, out := stop("cleanup-"+c.name, c.sig, c.group)
 		var errs []string
 		for _, l := range strings.Split(out, "\n") {
-			if strings.HasPrefix(l, "timeskip: ") && !strings.HasPrefix(l, "timeskip: stopping: ") && !strings.Contains(l, " timelines passed, ") && !strings.HasPrefix(l, "timeskip: the failed timelines' logs are in ") {
+			if strings.HasPrefix(l, "timeskip: ") && !strings.HasPrefix(l, "timeskip: stopping: ") && !strings.Contains(l, " timelines passed") && !strings.HasPrefix(l, "timeskip: the failed timelines' logs are in ") {
 				errs = append(errs, l)
 			}
 		}
