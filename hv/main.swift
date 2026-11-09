@@ -351,7 +351,9 @@ func save(_ path: String, cntvct: UInt64) {
 
 // saveMemory writes guest memory to dst, sparse. Booted, that's the pages
 // the guest touched that aren't zero; restored, a clone of the file it was
-// restored from with the pages it changed (copied on write) written over.
+// restored from with the pages it changed (copied on write) written over,
+// or made holes where they're zero now (the guest zeroes pages it frees
+// during setup: written, they'd take as much room as data).
 func saveMemory(_ dst: String) {
 	let n = Int(ramSize) / page
 	var info = [CChar](repeating: 0, count: n)
@@ -364,24 +366,29 @@ func saveMemory(_ dst: String) {
 	let zero = UnsafeMutableRawPointer.allocate(byteCount: page, alignment: page)
 	zero.initializeMemory(as: UInt8.self, repeating: 0, count: page)
 	defer { zero.deallocate() }
-	// A page to write: booted, one the guest touched that isn't zero (the
-	// rest are holes); restored, one in the mapping's own (anonymous) copy,
-	// in memory or compressed, which overwrites the clone even if zero.
-	func changed(_ i: Int) -> Bool {
+	// Each page's fate: 0 left as it is (a hole, booted; the clone's,
+	// restored), 1 written, 2 made a hole. Booted, a page the guest touched
+	// that isn't zero is written; restored, one in the mapping's own
+	// (anonymous) copy, in memory or compressed, is written or, if zero, made
+	// a hole.
+	let fate: [Int] = (0..<n).map { i in
 		let f = Int32(info[i])
-		if memFile != nil { return f & (MINCORE_COPIED | MINCORE_ANONYMOUS) != 0 }
-		return f & (MINCORE_INCORE | MINCORE_PAGED_OUT) != 0 && memcmp(ram + i * page, zero, page) != 0
+		let touched = memFile != nil ? f & (MINCORE_COPIED | MINCORE_ANONYMOUS) != 0 : f & (MINCORE_INCORE | MINCORE_PAGED_OUT) != 0
+		if !touched { return 0 }
+		if memcmp(ram + i * page, zero, page) != 0 { return 1 }
+		return memFile != nil ? 2 : 0
 	}
-	var written = 0, i = 0
+	var i = 0
 	while i < n {
-		guard changed(i) else {
-			i += 1
-			continue
-		}
 		var j = i + 1
-		while j < n && j - i < 256 && changed(j) { j += 1 }
-		if pwrite(fd, ram + i * page, (j - i) * page, off_t(i * page)) != (j - i) * page { fail("write \(dst): \(String(cString: strerror(errno)))") }
-		written += j - i
+		while j < n && fate[j] == fate[i] && (fate[i] != 1 || j - i < 256) { j += 1 }
+		if fate[i] == 1, pwrite(fd, ram + i * page, (j - i) * page, off_t(i * page)) != (j - i) * page {
+			fail("write \(dst): \(String(cString: strerror(errno)))")
+		}
+		if fate[i] == 2 {
+			var h = fpunchhole_t(fp_flags: 0, reserved: 0, fp_offset: off_t(i * page), fp_length: off_t((j - i) * page))
+			if fcntl(fd, F_PUNCHHOLE, &h) != 0 { fail("punching a hole in \(dst): \(String(cString: strerror(errno)))") }
+		}
 		i = j
 	}
 }
