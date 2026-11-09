@@ -73,7 +73,8 @@ const usage = `usage:
       run is using: all, or those not used for that long.
   timeskip version
 
-Exits 0 when every timeline passes, 1 when one fails, 125 if the project's
+Exits 0 when the run passes (every timeline passes and every property
+holds, a Sometimes assertion included), 1 when not, 125 if the project's
 setup failed, 130 if interrupted, or 2 for usage and harness errors.
 
 Environment: TS_CACHE (default ~/.cache/timeskip; on APFS, XFS or btrfs VM
