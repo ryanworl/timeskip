@@ -101,6 +101,17 @@ func (b *buildSpec) dockerfile() string {
 	}
 }
 
+// resolved is path with its symlinks resolved, if it can be: Compose
+// resolves some of the paths it reports (develop.watch's) and not others
+// (the build context's, the project's), so they're compared resolved.
+// (/tmp on macOS is a symlink.)
+func resolved(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	return path
+}
+
 // Options says how Create bundles.
 type Options struct {
 	// Cache is for timeskip test's bundle of a compose file in the cache: it builds only
@@ -189,12 +200,9 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 	// Host files the project mounts go in the bundle, if they're the
 	// project's: in its directory, as Antithesis's config image holds them.
 	abs, _ := filepath.Abs(composeFile)
-	pdir, mounts := filepath.Dir(abs), map[string]string{}
+	pdir, mounts := resolved(filepath.Dir(abs)), map[string]string{}
 	mount := func(what, src string) error {
-		real, err := filepath.EvalSymlinks(src) // (what a symlink mounts, as Docker mounts it)
-		if err != nil {
-			real = src
-		}
+		real := resolved(src) // (what a symlink mounts, as Docker mounts it)
 		if rel, err := filepath.Rel(pdir, real); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 			return fmt.Errorf("%s %s, outside the project's directory %s, which the VM doesn't have: move it into the project", what, src, pdir)
 		}
@@ -225,12 +233,7 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 			if fi, err := os.Stat(specs[name].Context); err != nil || !fi.IsDir() {
 				return nil, fmt.Errorf("service %s: build: context %s isn't a directory here", name, specs[name].Context)
 			}
-			// (Compared with the sync rules' paths, resolved too: Compose
-			// resolves symlinks in those, not in the context. /tmp on macOS
-			// is one.)
-			if real, err := filepath.EvalSymlinks(specs[name].Context); err == nil {
-				specs[name].Context = real
-			}
+			specs[name].Context = resolved(specs[name].Context)
 		}
 		for i, w := range s.Develop.Watch {
 			if w.Action == "sync+exec" {
@@ -239,9 +242,7 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 			if !strings.HasPrefix(w.Action, "sync") {
 				continue
 			}
-			if real, err := filepath.EvalSymlinks(w.Path); err == nil {
-				w.Path = real
-			}
+			w.Path = resolved(w.Path)
 			skip, err := skipper(w, specs[name])
 			if err != nil {
 				return nil, fmt.Errorf("service %s: develop.watch: %v", name, err)
@@ -421,7 +422,7 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		dev, _ := s.(map[string]any)["develop"].(map[string]any)
 		ws, _ := dev["watch"].([]any)
 		for _, w := range ws {
-			if rel, err := filepath.Rel(pdir, unescape(w.(map[string]any)["path"])); err == nil {
+			if rel, err := filepath.Rel(pdir, resolved(unescape(w.(map[string]any)["path"]))); err == nil {
 				w.(map[string]any)["path"] = strings.ReplaceAll(rel, "$", "$$")
 			}
 		}
