@@ -287,7 +287,15 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 	ins := map[string]string{} // each built image's inputs (see buildInputs)
 	for _, name := range names {
 		if b := specs[name]; b != nil && o.Cache {
-			if ins[name], err = buildInputs(name, p.Services[name], b, syncs, &sums); err != nil {
+			// (Less what any service of its image syncs, as docker compose
+			// watch never rebuilds for a synced path.)
+			var shared []Sync
+			for _, y := range syncs {
+				if p.Services[y.Service].Image == p.Services[name].Image {
+					shared = append(shared, y)
+				}
+			}
+			if ins[name], err = buildInputs(p.Services[name], b, shared, &sums); err != nil {
 				return nil, fmt.Errorf("service %s: %v", name, err)
 			}
 		}

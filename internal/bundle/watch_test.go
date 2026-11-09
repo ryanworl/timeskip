@@ -95,7 +95,7 @@ func TestBuildInputs(t *testing.T) {
 	var syncs []Sync
 	inputs := func() string {
 		t.Helper()
-		in, err := buildInputs("s", service{}, b, syncs, &sums)
+		in, err := buildInputs(service{}, b, syncs, &sums)
 		if err != nil {
 			t.Fatal(err)
 		}

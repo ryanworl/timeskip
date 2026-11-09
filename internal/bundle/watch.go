@@ -204,11 +204,12 @@ func matcher(root string, patterns []string, watch bool) (*patternmatcher.Patter
 // buildInputs digests what building s reads, as far as timeskip can tell
 // without building: its build options, and the path, mode and contents of
 // its Dockerfile, of each file in its context less what .dockerignore
-// excludes and its sync rules deliver (sync, not a new image, brings
-// those), and of each file under its rebuild rules' paths; and the path
+// excludes and syncs deliver (sync, not a new image, brings those: syncs
+// are the rules of every service of its image), and of each file under its
+// rebuild rules' paths; and the path
 // and mode of each directory among those. Paths are relative to the
 // context, so that another checkout of the project has the same inputs.
-func buildInputs(name string, s service, b *buildSpec, syncs []Sync, sums *fileSums) (string, error) {
+func buildInputs(s service, b *buildSpec, syncs []Sync, sums *fileSums) (string, error) {
 	h := sha256.New()
 	rel := func(p string) string { r, _ := filepath.Rel(b.Context, p); return r }
 	o := *b
@@ -218,7 +219,7 @@ func buildInputs(name string, s service, b *buildSpec, syncs []Sync, sums *fileS
 	fmt.Fprintln(h, buildPolicy)
 	synced := func(p string, dir bool) bool {
 		return slices.ContainsFunc(syncs, func(y Sync) bool {
-			return y.Service == name && (p == y.Path || strings.HasPrefix(p, y.Path+"/")) && !y.Skip(p, dir)
+			return (p == y.Path || strings.HasPrefix(p, y.Path+"/")) && !y.Skip(p, dir)
 		})
 	}
 	var errs []error
