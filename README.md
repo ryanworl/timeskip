@@ -49,7 +49,7 @@ Useful flags: `--timelines N`, `--seed N`, `--template NAME`, `-j N` (VMs at onc
 
 ## Results
 
-timeskip prints a line per timeline and per property, with a replay command for each failure. It keeps each failed timeline's console log and `.containers.log` (every container's output, timed in guest seconds) in `~/.cache/timeskip/logs` (the last 10 runs'), or with `--out DIR` in `DIR/logs/TIME`, a directory of the run's own. `timeskip cache` lists what the cache holds and its sizes, and `timeskip cache prune` removes what no run is using.
+timeskip prints a line per timeline and per property, with a replay command for each failure. It keeps each failed timeline's console log and `.containers.log` (every container's output, timed in guest seconds) in `~/.cache/timeskip/logs` (the last 10 runs'), or with `--out DIR` in `DIR/logs/TIME`, a directory of the run's own. `--keep-logs` keeps every timeline's logs the same way; a run of one timeline (one `--seed`) streams its console and keeps its `.containers.log` already. `timeskip cache` lists what the cache holds and its sizes, and `timeskip cache prune` removes what no run is using.
 
 Exit codes: 0 passed, 1 failed, 125 setup failed, 130 interrupted, 2 usage or harness error.
 

@@ -31,7 +31,7 @@ import (
 
 const usage = `usage:
   timeskip test [compose.yaml|app.tsb] [--template NAME]... [--timelines N] [-j N]
-                [--seed N] [--set KEY=VALUE]... [--out DIR] [--profile]
+                [--seed N] [--set KEY=VALUE]... [--out DIR] [--profile] [--keep-logs]
                 [--explore] [--branch DIR] [--max-failures [first:]N]
                 [--no-build] [--no-skip]
       Run the project's test templates (/opt/antithesis/test/v1/NAME/ in its
@@ -58,6 +58,7 @@ const usage = `usage:
       --out DIR writes results.json, each instrumented module's functions
       (coverage/MODULE.functions.tsv) and, with --profile, each timeline's
       stacks sampled every 10 ms of CPU time (profiles/TEMPLATE-SEED.folded).
+      --keep-logs keeps every timeline's logs, as the failed ones' are kept.
       --explore branches timelines from moments that reached new edges or
       assertion states; --branch replays one, kept when a timeline from it
       failed. --max-failures N stops the run once N timelines failed
@@ -239,6 +240,7 @@ func main() {
 		fs.Uint64Var(&o.seed, "seed", 0, "")
 		fs.StringVar(&o.out, "out", "", "")
 		fs.BoolVar(&o.profile, "profile", false, "")
+		fs.BoolVar(&o.keepLogs, "keep-logs", false, "")
 		fs.BoolVar(&o.explore, "explore", false, "")
 		fs.StringVar(&o.branch, "branch", "", "")
 		fs.Func("max-failures", "", func(v string) error {

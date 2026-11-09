@@ -34,6 +34,7 @@ type options struct {
 	replay                   bool     // a replay: one planned timeline of a given seed (--seed) or from --branch
 	out                      string   // where to write results.json, coverage/ and profiles/, if anywhere
 	profile                  bool
+	keepLogs                 bool   // keep every timeline's logs, not only the failed ones' (--keep-logs)
 	explore                  bool   // branch timelines from moments that did something new (see explore.go)
 	branch                   string // a branch point's checkpoint to run the timelines from (a replay)
 	maxFailures              int    // stop the run once this many timelines failed (0: never)
@@ -172,10 +173,10 @@ func cmdTest(setup *checkpoint, o options) {
 			if x != nil && p.from != nil {
 				x.done(p.from, !r.Pass)
 			}
-			if r.Pass { // (a log that isn't kept: see below)
+			if r.Pass && !o.keepLogs { // (a log that isn't kept: see below)
 				os.RemoveAll(filepath.Dir(r.Log))
 			}
-			if r.Pass || len(plans) == 1 {
+			if r.Pass && !o.keepLogs || len(plans) == 1 {
 				r.Log = ""
 			}
 			mu.Lock()
@@ -205,8 +206,9 @@ func cmdTest(setup *checkpoint, o options) {
 	if x != nil {
 		x.keepFailed(results)
 	}
-	// Keep the logs of the timelines that failed (with one timeline, the
-	// console streamed) and their containers' logs: with --out, with the
+	// Keep the logs of the timelines that failed, or with --keep-logs all
+	// (with one timeline, the console streamed), and their containers'
+	// logs: with --out, with the
 	// results, where the cache's trim doesn't reach them.
 	// With --out, in a directory of this run's own under DIR/logs, so that
 	// runs into the same DIR don't overwrite each other's.
@@ -230,7 +232,7 @@ func cmdTest(setup *checkpoint, o options) {
 	}
 	ok := report(results, o)
 	if exists(keep) {
-		fmt.Fprintf(os.Stderr, "timeskip: the failed timelines' logs are in %s\n", keep)
+		fmt.Fprintf(os.Stderr, "timeskip: the %stimelines' logs are in %s\n", map[bool]string{false: "failed "}[o.keepLogs], keep)
 	}
 	trim(unused)
 	if interrupted {
@@ -323,7 +325,7 @@ func timeline(setup *checkpoint, p *plan, o options, x *explorer, runs string, e
 				}
 				r.Wall = (time.Since(t0) - paused).Seconds()
 				r.Pass = len(r.Errors) == 0 && len(broken(r)) == 0
-				if !r.Pass {
+				if !r.Pass || o.keepLogs {
 					v.send("LOGS", "")
 					switch l := v.nextLine(); {
 					case l.verb == "LOGGED" && containerLogs(data, filepath.Join(dir, "containers.log")):
