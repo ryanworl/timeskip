@@ -225,6 +225,12 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 			if fi, err := os.Stat(specs[name].Context); err != nil || !fi.IsDir() {
 				return nil, fmt.Errorf("service %s: build: context %s isn't a directory here", name, specs[name].Context)
 			}
+			// (Compared with the sync rules' paths, resolved too: Compose
+			// resolves symlinks in those, not in the context. /tmp on macOS
+			// is one.)
+			if real, err := filepath.EvalSymlinks(specs[name].Context); err == nil {
+				specs[name].Context = real
+			}
 		}
 		for i, w := range s.Develop.Watch {
 			if w.Action == "sync+exec" {
@@ -232,6 +238,9 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 			}
 			if !strings.HasPrefix(w.Action, "sync") {
 				continue
+			}
+			if real, err := filepath.EvalSymlinks(w.Path); err == nil {
+				w.Path = real
 			}
 			skip, err := skipper(w, specs[name])
 			if err != nil {
