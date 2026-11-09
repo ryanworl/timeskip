@@ -232,7 +232,7 @@ func cmdTest(setup *checkpoint, o options) {
 	if exists(keep) {
 		fmt.Fprintf(os.Stderr, "timeskip: the failed timelines' logs are in %s\n", keep)
 	}
-	trim()
+	trim(unused)
 	if interrupted {
 		exit(130)
 	}

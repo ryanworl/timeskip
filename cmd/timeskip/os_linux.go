@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"strings"
 	"syscall"
+	"unsafe"
 )
 
 const seekData, seekHole = 3, 4
@@ -180,3 +182,42 @@ func childAttr() *syscall.SysProcAttr {
 
 // osBuild: KVM's saved state doesn't depend on the host's kernel.
 func osBuild() string { return "" }
+
+// ownSize is the bytes of file f's that no clone shares (its extents
+// without FIEMAP_EXTENT_SHARED: XFS's and btrfs's reflinks), or alloc, its
+// allocated bytes, if they can't be read.
+func ownSize(f string, alloc int64) int64 {
+	file, err := os.Open(f)
+	if err != nil {
+		return alloc
+	}
+	defer file.Close()
+	// struct fiemap, then fm_extent_count struct fiemap_extents.
+	const n = 256
+	buf := make([]uint64, (32+56*n)/8)
+	b := unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), len(buf)*8)
+	var start, shared uint64
+	for {
+		clear(b)
+		binary.LittleEndian.PutUint64(b[0:], start)
+		binary.LittleEndian.PutUint64(b[8:], ^uint64(0)-start)
+		binary.LittleEndian.PutUint32(b[24:], n)
+		if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), 0xc020660b, uintptr(unsafe.Pointer(&b[0]))); e != 0 { // FS_IOC_FIEMAP
+			return alloc
+		}
+		mapped := int(binary.LittleEndian.Uint32(b[20:]))
+		last := mapped == 0
+		for i := range mapped {
+			x := b[32+56*i:]
+			length, flags := binary.LittleEndian.Uint64(x[16:]), binary.LittleEndian.Uint32(x[40:])
+			if flags&0x2000 != 0 { // FIEMAP_EXTENT_SHARED
+				shared += length
+			}
+			last = last || flags&1 != 0 // FIEMAP_EXTENT_LAST
+			start = binary.LittleEndian.Uint64(x[0:]) + length
+		}
+		if last {
+			return max(alloc-int64(shared), 0)
+		}
+	}
+}

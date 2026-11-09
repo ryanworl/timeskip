@@ -89,7 +89,7 @@ func TestTrim(t *testing.T) {
 		t.Fatal("can't lock held")
 	}
 	defer syscall.Close(fd)
-	trim()
+	trim(unused)
 
 	for p, keep := range map[string]bool{
 		"checkpoints/old": false, "checkpoints/old.lock": false,

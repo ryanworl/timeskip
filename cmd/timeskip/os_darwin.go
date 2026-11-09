@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"unsafe"
 )
 
 // cores is the number of performance cores: those of every perflevel but
@@ -61,4 +62,24 @@ func childAttr() *syscall.SysProcAttr { return &syscall.SysProcAttr{Setpgid: tru
 func osBuild() string {
 	b, _ := syscall.Sysctl("kern.osversion")
 	return b
+}
+
+// ownSize is the bytes of file f's that no clone shares (APFS's private
+// size), or alloc, its allocated bytes, if that can't be read.
+func ownSize(f string, alloc int64) int64 {
+	// getattrlist(2) with FSOPT_ATTR_CMN_EXTENDED: ATTR_CMNEXT_PRIVATESIZE
+	// (a fork attribute), after the returned length.
+	a := struct {
+		bitmapcount, reserved        uint16
+		common, vol, dir, file, fork uint32
+	}{bitmapcount: 5, fork: 0x8}
+	var buf [16]byte
+	p, err := syscall.BytePtrFromString(f)
+	if err != nil {
+		return alloc
+	}
+	if _, _, e := syscall.Syscall6(syscall.SYS_GETATTRLIST, uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&a)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0x20|0x1, 0); e != 0 {
+		return alloc
+	}
+	return int64(binary.LittleEndian.Uint64(buf[4:12]))
 }

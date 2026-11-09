@@ -1252,4 +1252,14 @@ func TestCleanup(t *testing.T) {
 	if l := leftovers(); len(l) > 0 {
 		t.Errorf("after a killed run, the next left %v", l)
 	}
+	// The cache lists its checkpoints and bundles; pruning what no run used
+	// for a day keeps them.
+	for _, kind := range []string{"base", "created", "setup", "bundle"} {
+		if rc, out := timeskip(t, "cache", "cache"); rc != 0 || !strings.Contains(out, "  "+kind+"  ") {
+			t.Errorf("timeskip cache: exit %d, no %s in %q", rc, kind, out)
+		}
+	}
+	if rc, out := timeskip(t, "cache-prune", "cache", "prune", "--older-than", "1d"); rc != 0 || !strings.Contains(out, "removed 0 of ") {
+		t.Errorf("timeskip cache prune --older-than 1d: exit %d, %q; want 0 and nothing removed", rc, out)
+	}
 }

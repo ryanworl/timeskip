@@ -66,6 +66,10 @@ const usage = `usage:
       run. --no-skip runs in real time.
   timeskip bundle [compose.yaml] [--no-build] [--arch arm64|amd64] -o app.tsb
       Pack the project's images and compose file into a bundle (needs Docker).
+  timeskip cache [prune [--older-than 7d]]
+      List the cache's checkpoints, cached bundles, logs and branch points,
+      with their sizes and when a run last used them; prune removes those no
+      run is using: all, or those not used for that long.
   timeskip version
 
 Exits 0 when every timeline passes, 1 when one fails, 125 if the project's
@@ -298,6 +302,22 @@ func main() {
 			setup = mustSetup(setupCheckpoint(mine, b, edits))
 		}
 		cmdTest(setup, o)
+	case "cache":
+		if len(args) > 0 && args[0] == "prune" {
+			var age time.Duration
+			older := fs.String("older-than", "", "")
+			parse(fs, args[1:], 0)
+			if *older != "" {
+				var err error
+				if age, err = parseAge(*older); err != nil || age <= 0 {
+					die("--older-than %s: give a duration such as 7d or 12h", *older)
+				}
+			}
+			cachePrune(age, *older)
+		} else {
+			parse(fs, args, 0)
+			cacheList()
+		}
 	case "version":
 		parse(fs, args, 0)
 		m, err := os.ReadFile(filepath.Join(home, "MANIFEST"))
@@ -326,7 +346,7 @@ func project(pos []string) string {
 func mustSetup(c *checkpoint, err error) *checkpoint {
 	sweep()
 	if err != nil {
-		trim()
+		trim(unused)
 		exit(125)
 	}
 	return c

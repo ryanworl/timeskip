@@ -305,13 +305,14 @@ func used(p string) {
 // gigabytes.
 var keepLast = map[string]int{"logs": 10, "branches": 3}
 
-// trim removes what the cache kept unused for longer than unused, unless
+// trim removes what the cache kept unused for longer than age (as runs
+// trim it, unused; timeskip cache prune, 0 by default: everything), unless
 // a run is using it; of the logs and branch points runs kept, all but the
 // last runs' (keepLast); cached bundles whose project is gone, and
 // checkpoints whose bundle is; branch points whose setup checkpoint is
 // gone; and images projects whose bundle is gone (see imagesCheckpoint).
-func trim() {
-	old := func(p string) bool { fi, err := os.Stat(p); return err == nil && time.Since(fi.ModTime()) > unused }
+func trim(age time.Duration) {
+	old := func(p string) bool { fi, err := os.Stat(p); return err == nil && time.Since(fi.ModTime()) > age }
 	locks, _ := filepath.Glob(filepath.Join(cache, "checkpoints", "*.lock"))
 	for _, l := range locks {
 		// (Unused, or never finished: a run killed while it made it.)
