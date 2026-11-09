@@ -265,30 +265,77 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		}
 	}
 
-	// Synced is what each sync rule's path held when the image was built,
-	// so that a file deleted since is deleted in the container too.
+	// Synced is what each sync rule's path held when the image was built
+	// (relative to it), so that a file deleted since is deleted in the
+	// container too.
 	type record struct {
 		Inputs, Image string
 		Synced        map[int][]string
 	}
+	readState := func(b string) map[string]record {
+		state := map[string]record{}
+		raw, _ := os.ReadFile(b + ".inputs")
+		json.Unmarshal(raw, &state)
+		return state
+	}
 	state, sums := map[string]record{}, fileSums{map[string]string{}, map[string]string{}}
-	// down is why Docker's daemon can't be reached, if it can't; then had
-	// is out's images, each name's line in its images file, which it must
-	// already hold (see Create).
-	var down error
-	had := map[string]string{}
 	if o.Cache {
-		b, _ := os.ReadFile(out + ".inputs")
-		json.Unmarshal(b, &state)
-		b, _ = os.ReadFile(out + ".sums")
+		state = readState(out)
+		b, _ := os.ReadFile(out + ".sums")
 		json.Unmarshal(b, &sums.was)
+	}
+	ins := map[string]string{} // each built image's inputs (see buildInputs)
+	for _, name := range names {
+		if b := specs[name]; b != nil && o.Cache {
+			if ins[name], err = buildInputs(name, p.Services[name], b, syncs, &sums); err != nil {
+				return nil, fmt.Errorf("service %s: %v", name, err)
+			}
+		}
+	}
+	// down is why Docker's daemon can't be reached, if it can't; then src
+	// is the bundle whose images this one keeps, and had its images, each
+	// name's line in its images file: out's, or if out doesn't hold every
+	// image (built from these inputs, as recorded when it was built, which
+	// build checked reached Docker's images), another bundle's in the cache
+	// that does (another checkout's, say: a new git worktree's).
+	var down error
+	src, had := out, map[string]string{}
+	imagesOf := func(b string) map[string]string {
+		had := map[string]string{}
+		for _, l := range strings.Split(Files(b)["images"], "\n") {
+			if img, id, ok := strings.Cut(l, " "); ok {
+				had[img] = id
+			}
+		}
+		return had
+	}
+	holds := func(state map[string]record, had map[string]string) bool {
+		for _, name := range names {
+			img := p.Services[name].Image
+			if r := state[name]; had[img] == "" || specs[name] != nil && (r.Inputs != ins[name] || r.Image != had[img]) {
+				return false
+			}
+		}
+		return true
 	}
 	if _, err := output("docker", "version", "--format", "{{.Server.Version}}"); err != nil {
 		e := strings.TrimSpace(err.Error())
 		down = errors.New(e[strings.LastIndexByte(e, '\n')+1:])
-		for _, l := range strings.Split(Files(out)["images"], "\n") {
-			if img, id, ok := strings.Cut(l, " "); ok {
-				had[img] = id
+		had = imagesOf(out)
+		others, _ := filepath.Glob(filepath.Join(filepath.Dir(out), "*.tsb"))
+		for _, b := range others {
+			if !o.Cache || holds(state, had) {
+				break
+			}
+			// (A project's bundle: one of images, for an images checkpoint,
+			// has no records. Read from its link: one version of it.)
+			l := filepath.Join(tmp, "donor.tsb")
+			os.Remove(l)
+			if _, err := os.Stat(b + ".inputs"); b == out || err != nil || os.Link(b, l) != nil {
+				continue
+			}
+			if st, h := readState(b), imagesOf(l); holds(st, h) {
+				src, state, had = l, st, h
 			}
 		}
 	}
@@ -300,32 +347,25 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		if b == nil {
 			continue
 		}
-		var in string
 		if o.Cache {
-			if in, err = buildInputs(name, s, b, syncs, &sums); err != nil {
-				return nil, fmt.Errorf("service %s: %v", name, err)
-			}
-			// (Without Docker, the image built from these inputs is the one
-			// out holds, recorded when it was built, which build checked
-			// reached Docker's images.)
 			r := state[name]
-			if r.Inputs == in && down != nil && r.Image != "" && r.Image == had[s.Image] {
+			if r.Inputs == ins[name] && down != nil && r.Image != "" && r.Image == had[s.Image] {
 				continue
 			}
-			if r.Inputs == in && down == nil && r.Image == imageID(s.Image, plats[s.Image]) {
+			if r.Inputs == ins[name] && down == nil && r.Image == imageID(s.Image, plats[s.Image]) {
 				continue
 			}
 		}
 		if down != nil {
-			return nil, needsDocker(fmt.Sprintf("%s needs building (its build inputs changed, or the cached bundle doesn't hold the image built from them)", s.Image))
+			return nil, needsDocker(fmt.Sprintf("%s needs building (its build inputs changed, or no cached bundle holds the image built from them)", s.Image))
 		}
 		if err := build(s.Image, *b, plats[s.Image], log); err != nil {
 			return nil, fmt.Errorf("building %s: %v", s.Image, err)
 		}
-		r := record{in, imageID(s.Image, plats[s.Image]), map[int][]string{}}
+		r := record{ins[name], imageID(s.Image, plats[s.Image]), map[int][]string{}}
 		for _, y := range syncs {
 			if y.Service == name {
-				if r.Synced[y.Rule], err = y.Files(); err != nil {
+				if r.Synced[y.Rule], err = y.relFiles(); err != nil {
 					return nil, fmt.Errorf("service %s: develop.watch: %v", name, err)
 				}
 			}
@@ -337,13 +377,13 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		if len(was) == 0 {
 			continue
 		}
-		now, err := y.Files()
+		now, err := y.relFiles()
 		if err != nil {
 			return nil, fmt.Errorf("service %s: develop.watch: %v", y.Service, err)
 		}
 		for _, f := range was {
 			if !slices.Contains(now, f) {
-				syncs[i].Deleted = append(syncs[i].Deleted, f)
+				syncs[i].Deleted = append(syncs[i].Deleted, filepath.Join(y.Path, f))
 			}
 		}
 	}
@@ -494,7 +534,7 @@ func Create(composeFile, arch, out string, o Options) ([]Sync, error) {
 		// (Only the project's other files changed, its compose file or
 		// what it mounts: its images are out's.)
 		fmt.Fprintf(log, "note: Docker's daemon isn't reachable: the bundle keeps the cached bundle's images\n")
-		if err := copyImages(out, dir); err != nil {
+		if err := copyImages(src, dir); err != nil {
 			return nil, err
 		}
 		groups = nil

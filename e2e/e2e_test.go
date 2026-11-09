@@ -538,6 +538,16 @@ func TestBundles(t *testing.T) {
 		if rc, out := timeskip(t, "edits-no-docker-compose", "test", f); rc != 0 || !strings.Contains(out, "keeps the cached bundle's images") || !strings.Contains(out, "setting up") {
 			t.Errorf("exit %d; want 0, a bundle written again and setup again", rc)
 		}
+		// Another checkout of the project (a git worktree, say) uses its
+		// images too.
+		checkout := filepath.Join(work, "edits-checkout")
+		os.RemoveAll(checkout)
+		if out, err := exec.Command("cp", "-Rp", dir, checkout).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if rc, out := timeskip(t, "edits-no-docker-checkout", "test", filepath.Join(checkout, "compose.yaml")); rc != 0 || !strings.Contains(out, "pong 1 v4") || !strings.Contains(out, "keeps the cached bundle's images") {
+			t.Errorf("exit %d; want 0, the other checkout's images and its synced pong.sh's answers", rc)
+		}
 		edit(t, filepath.Join(dir, "pong", "Dockerfile"), "RUN echo v3", "RUN echo v5")
 		if rc, out := timeskip(t, "edits-no-docker-build", "test", f); rc != 2 || !strings.Contains(out, "needs building") {
 			t.Errorf("exit %d; want 2 and that pong needs building", rc)

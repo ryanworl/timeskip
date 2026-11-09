@@ -55,6 +55,16 @@ func (y Sync) Files() ([]string, error) {
 	return l, err
 }
 
+// relFiles are the rule's files relative to Path, as the cached bundle's
+// records keep them: the same in another checkout of the project.
+func (y Sync) relFiles() ([]string, error) {
+	l, err := y.Files()
+	for i, f := range l {
+		l[i], _ = filepath.Rel(y.Path, f)
+	}
+	return l, err
+}
+
 // Walk calls fn with root and each file and directory under it that skip
 // doesn't leave out, pruning the directories it leaves out whole. (A root
 // that's a file is left out too if skip says so, as compose watch matches
@@ -196,10 +206,14 @@ func matcher(root string, patterns []string, watch bool) (*patternmatcher.Patter
 // its Dockerfile, of each file in its context less what .dockerignore
 // excludes and its sync rules deliver (sync, not a new image, brings
 // those), and of each file under its rebuild rules' paths; and the path
-// and mode of each directory among those.
+// and mode of each directory among those. Paths are relative to the
+// context, so that another checkout of the project has the same inputs.
 func buildInputs(name string, s service, b *buildSpec, syncs []Sync, sums *fileSums) (string, error) {
 	h := sha256.New()
-	opts, _ := json.Marshal(b)
+	rel := func(p string) string { r, _ := filepath.Rel(b.Context, p); return r }
+	o := *b
+	o.Context, o.Dockerfile = "", rel(b.dockerfile())
+	opts, _ := json.Marshal(o)
 	h.Write(opts)
 	fmt.Fprintln(h, buildPolicy)
 	synced := func(p string, dir bool) bool {
@@ -212,13 +226,13 @@ func buildInputs(name string, s service, b *buildSpec, syncs []Sync, sums *fileS
 		return Walk(root, skip, func(p string, fi fs.FileInfo) {
 			if fi.IsDir() {
 				if !synced(p, true) {
-					fmt.Fprintf(h, "%s %o\n", p, fi.Mode())
+					fmt.Fprintf(h, "%s %o\n", rel(p), fi.Mode())
 				}
 				return
 			}
 			sum, err := sums.of(p, fi)
 			errs = append(errs, err)
-			fmt.Fprintf(h, "%s %o %s\n", p, fi.Mode(), sum)
+			fmt.Fprintf(h, "%s %o %s\n", rel(p), fi.Mode(), sum)
 		})
 	}
 	patterns, err := dockerignore(b)
