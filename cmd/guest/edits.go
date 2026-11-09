@@ -32,7 +32,10 @@ type edit struct {
 }
 
 func mountInputs(spec string) {
-	if strings.HasPrefix(spec, "blk:") {
+	switch {
+	case spec == "virtiofs":
+		check(syscall.Mount("inputs", "/inputs", "virtiofs", syscall.MS_RDONLY, ""))
+	case strings.HasPrefix(spec, "blk:"):
 		waitDrive("vdc", spec)
 		exec.Command("blockdev", "--flushbufs", "/dev/vdc").Run()
 		check(syscall.Mount("/dev/vdc", "/inputs", "ext4", syscall.MS_RDONLY, ""))

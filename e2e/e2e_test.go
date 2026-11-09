@@ -371,7 +371,7 @@ func edit(t *testing.T, path, old, new string) {
 
 func TestBundles(t *testing.T) {
 	arch := runtime.GOARCH
-	t.Run("a new version of a bundle replaces its checkpoint", func(t *testing.T) {
+	t.Run("a new version of a bundle replaces its checkpoints", func(t *testing.T) {
 		f, b := project(t, "versions"), filepath.Join(work, "versions.tsb")
 		for i, v := range []string{"v1", "v2"} {
 			if i > 0 {
@@ -391,8 +391,8 @@ func TestBundles(t *testing.T) {
 				n++
 			}
 		}
-		if n != 1 {
-			t.Errorf("%d checkpoints for %s, want 1", n, b)
+		if n != 2 { // (its created and setup checkpoints)
+			t.Errorf("%d checkpoints for %s, want 2", n, b)
 		}
 	})
 	t.Run("a bundle carries its synced files and is reproducible", func(t *testing.T) {
@@ -477,10 +477,13 @@ func TestBundles(t *testing.T) {
 			t.Errorf("no finally_ command: %v", r.commands(0))
 		}
 		// A synced file: the project is set up again, pong starting with
-		// the new pong.sh.
+		// the new pong.sh, from its containers created with the images
+		// loaded.
 		pong := filepath.Join(dir, "pong", "pong.sh")
 		edit(t, pong, "v1", "v2")
-		step("sync+restart", "pong 1 v2", "setting up")
+		if rc, _, out := run(t, "edits-sync+restart", "test", f); rc != 0 || !strings.Contains(out, "pong 1 v2") || !strings.Contains(out, "setting up") || strings.Contains(out, "timeskip: loading") {
+			t.Errorf("exit %d; want 0, pong 1 v2, and setup again without loading the bundle again", rc)
+		}
 		// A file that can't stand in for the one it replaces fails setup:
 		// one no longer executable, or a binary for another architecture.
 		v2, _ := os.ReadFile(pong)
@@ -505,11 +508,11 @@ func TestBundles(t *testing.T) {
 		// An edit to the first_ command.
 		edit(t, filepath.Join(dir, "workload", "test", "first_handshake.sh"), "r=$(", `echo "edited first"; r=$(`)
 		step("first_", "edited first")
-		// A new image: the project is set up again with it, from the
+		// A new image: the bundle is loaded and set up again, from the
 		// checkpoint with the images it doesn't build; then not again.
 		edit(t, filepath.Join(dir, "pong", "Dockerfile"), "COPY pong.sh", "RUN echo v3 > /version\nCOPY pong.sh")
-		if rc, _, out := run(t, "edits-image", "test", f); rc != 0 || strings.Count(out, "timeskip: setting up") != 1 {
-			t.Errorf("exit %d, set up %d times; want 0, once", rc, strings.Count(out, "timeskip: setting up"))
+		if rc, _, out := run(t, "edits-image", "test", f); rc != 0 || strings.Count(out, "timeskip: loading") != 1 || strings.Count(out, "timeskip: setting up") != 1 {
+			t.Errorf("exit %d, loaded %d times, set up %d times; want 0, once, once", rc, strings.Count(out, "timeskip: loading"), strings.Count(out, "timeskip: setting up"))
 		}
 		if _, _, out := run(t, "edits-same", "test", f); strings.Contains(out, "setting up") {
 			t.Error("set up again with the same images")

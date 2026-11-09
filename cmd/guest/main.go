@@ -1,10 +1,11 @@
 //go:build linux
 
 // Command guest is timeskip's guest agent, /timeskip-guest in the VM, run by
-// /init once dockerd is up. It reports BASE (for the base checkpoint), and on
-// SETUP starts the bundle's Compose project, with the host's edits applied,
+// /init once dockerd is up. It reports BASE (for the base checkpoint); on
+// CREATE loads a bundle and creates its Compose project's containers and
+// reports CREATED; on SETUP starts them, with the host's edits applied,
 // waits for the project's setup_complete message, reports READY with the
-// project's test templates, and on GO runs a timeline: test commands
+// project's test templates; and on GO runs a timeline: test commands
 // scheduled as Antithesis's Test Composer schedules them (see
 // docs/reference.md for the protocol).
 package main
@@ -142,15 +143,20 @@ func main() {
 	os.Setenv("COMPOSE_FILE", bundled+"/compose.yaml:"+override)
 
 	base() // (the only boot: the base checkpoint's)
-	// Restored from a checkpoint: set up a bundle, or run a timeline.
+	// Restored from a checkpoint: load a bundle, set it up, or run a
+	// timeline.
 	for {
-		verb, body := await("SETUP", "GO")
-		if verb == "GO" {
+		verb, body := await("CREATE", "SETUP", "GO")
+		f := protocol.Fields(body)
+		switch verb {
+		case "CREATE":
+			create(f["bundle"])
+		case "SETUP":
+			setup(f["inputs"])
+		default:
 			timeline(protocol.ParseGo(body))
 			return
 		}
-		f := protocol.Fields(body)
-		setup(f["bundle"], f["inputs"])
 	}
 }
 
@@ -174,34 +180,57 @@ func base() {
 	msg("BASE", struct{}{})
 }
 
-// setup, given SETUP in a VM restored from the base checkpoint or another
-// bundle's (an images checkpoint, whose images it keeps), loads the bundle,
-// starts the project, waits for its setup_complete and an idle moment, and
-// reports READY, for the host to save the VM. bundle and inputs are
-// SETUP's bundle= and inputs=.
-func setup(bundle, inputs string) {
+// system is whether the bundle CREATE loaded has services that docker
+// compose up starts (see writeOverride).
+var system bool
+
+// create, given CREATE in a VM restored from the base checkpoint or another
+// bundle's (an images checkpoint, whose images it keeps), loads the bundle
+// (bundle is CREATE's bundle=), creates the project's containers and gives
+// each node its disk, and reports CREATED once the VM is idle, for the host
+// to save the VM: the bundle's created checkpoint, which its setups start
+// from.
+func create(bundle string) {
 	setSkip(true)
-	logsT0 = uptime()
 	// (Zeroing freed pages, as from boot, so that the save holds only live
-	// memory; freeze stops it again.)
+	// memory; the setup checkpoint's freeze stops it.)
 	os.WriteFile("/sys/module/kernel/parameters/timeskip_zero_free", []byte("Y"), 0o644)
 	say("loading the bundle")
 	check(os.RemoveAll(bundled))
 	check(os.MkdirAll(bundled, 0o755))
 	check(untarFile(bundleFile(bundle), bundled))
-	mountInputs(inputs)
-	system, err := writeOverride()
+	syscall.Unmount("/inputs", 0) // (the VM can be saved now)
+	var err error
+	system, err = writeOverride()
 	check(err)
 	watchExits()
 	check(os.WriteFile("/proc/sys/kernel/print-fatal-signals", []byte("1"), 0o644)) // (see crashes)
 	if system {
-		say("compose up")
-		start := uptime()
+		say("compose create")
 		ctx, cancel := context.WithTimeoutCause(context.Background(), setupMax, fmt.Errorf("not done after %v", setupMax))
 		// (Created first, so that each node gets its disk before it starts:
 		// see makeDisks.)
 		check(composeCtx(ctx, "create", "--quiet-pull"))
+		cancel()
 		check(makeDisks())
+	}
+	idle()
+	freeze(false)
+	msg("CREATED", struct{}{})
+}
+
+// setup, given SETUP in a VM restored from the bundle's created checkpoint,
+// copies the host's edits into its containers (inputs is SETUP's inputs=),
+// starts them, waits for the project's setup_complete and an idle moment,
+// and reports READY, for the host to save the VM.
+func setup(inputs string) {
+	setSkip(true)
+	logsT0 = uptime()
+	mountInputs(inputs)
+	if system {
+		say("compose up")
+		start := uptime()
+		ctx, cancel := context.WithTimeoutCause(context.Background(), setupMax, fmt.Errorf("not done after %v", setupMax))
 		apply(readEdits())
 		check(composeCtx(ctx, "up", "-d", "--quiet-pull"))
 		cancel()
@@ -226,7 +255,7 @@ func setup(bundle, inputs string) {
 	msg("READY", protocol.Ready{Catalog: cat.wire()})
 }
 
-// bundleFile is where SETUP's bundle is: on a virtiofs share (macOS), or
+// bundleFile is where CREATE's bundle is: on a virtiofs share (macOS), or
 // the first drive, swapped for it (Firecracker).
 func bundleFile(bundle string) string {
 	if bundle == "virtiofs" {

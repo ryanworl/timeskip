@@ -23,12 +23,14 @@ import (
 
 // A checkpoint is a saved VM (in $TS_CACHE/checkpoints): the base
 // checkpoint, saved once dockerd is up in a VM booted for the kit; a
-// bundle's setup checkpoint, restored from the base (or from an images
-// checkpoint, a bundle's of images only) and saved once the project wrote
+// bundle's created checkpoint, restored from the base (or from an images
+// checkpoint, the created checkpoint of a bundle of images only) and saved
+// once its images are loaded and its containers created; or its setup
+// checkpoint, restored from that and saved once the project wrote
 // setup_complete and went idle (or a branch point: see explore.go). Its
 // directory holds state and its memory (mem; on macOS, hvrun's
 // state.mem), disk (its data disk), meta.json and done (once it's
-// complete, and synced). A base or setup checkpoint also
+// complete, and synced). A base, created or setup checkpoint also
 // holds bundle.tsb (the bundle's drive: a link to the bundle, or the base's
 // placeholder) and inputs.ph (Linux: the inputs
 // drive's placeholder) or inputs/ (macOS: the share's).
@@ -130,6 +132,38 @@ func checkKit(dir, manifest string) error {
 // shared lock) until this process exits.
 func setupCheckpoint(b, origin string, edits []edit) (*checkpoint, error) {
 	c, err := saved(hash(bundle.ID(b), kitID(), memMB, slackArg(), syncKey(edits)), func(c *checkpoint) error {
+		from, err := createdCheckpoint(b, origin)
+		if err != nil {
+			return err
+		}
+		return build(c, b, origin, from, "SETUP", edits)
+	})
+	if err != nil {
+		return nil, err
+	}
+	prune(origin, c.dir, filepath.Join(cache, "checkpoints", createdID(b)))
+	return c, nil
+}
+
+// prune removes the checkpoints of the bundle at origin but keep's: older
+// versions aren't needed any more. And other kits' checkpoints (a cache
+// keeps the last kit's).
+func prune(origin string, keep ...string) {
+	others, _ := filepath.Glob(filepath.Join(cache, "checkpoints", "*", "meta.json"))
+	for _, o := range others {
+		var m meta
+		if raw, _ := os.ReadFile(o); json.Unmarshal(raw, &m) == nil && (m.Bundle == origin || m.Kit != kitID()) && !slices.Contains(keep, filepath.Dir(o)) {
+			remove(filepath.Dir(o))
+		}
+	}
+}
+
+// createdCheckpoint returns the created checkpoint of bundle b (b is, or
+// will be, at origin): its images loaded and its containers created, not
+// started, which its setups start from. It saves it first if there isn't
+// one, or returns why it couldn't, and holds it until this process exits.
+func createdCheckpoint(b, origin string) (*checkpoint, error) {
+	return saved(createdID(b), func(c *checkpoint) error {
 		// (A project's bundle in the cache leaves out the images it doesn't
 		// build: they're loaded in an images checkpoint, kept for its next
 		// builds.)
@@ -146,28 +180,17 @@ func setupCheckpoint(b, origin string, edits []edit) (*checkpoint, error) {
 				return err
 			}
 		}
-		return build(c, b, origin, from, edits)
+		return build(c, b, origin, from, "CREATE", nil)
 	})
-	if err != nil {
-		return nil, err
-	}
-	// Older versions of the bundle's checkpoints aren't needed any more,
-	// nor other kits' checkpoints (a cache keeps the last kit's).
-	others, _ := filepath.Glob(filepath.Join(cache, "checkpoints", "*", "meta.json"))
-	for _, o := range others {
-		var m meta
-		if raw, _ := os.ReadFile(o); json.Unmarshal(raw, &m) == nil && (m.Bundle == origin || m.Kit != c.meta.Kit) && filepath.Dir(o) != c.dir {
-			remove(filepath.Dir(o))
-		}
-	}
-	return c, nil
 }
 
-// imagesCheckpoint is the setup checkpoint of a project of images:
+func createdID(b string) string { return hash(bundle.ID(b), kitID(), memMB, slackArg()) }
+
+// imagesCheckpoint is the created checkpoint of a project of images:
 // bundled from a compose file listing them in a profile that's never
 // started, so that they're loaded and nothing runs. Or why it couldn't be
-// made. A project's setup starts from one, given the images it doesn't
-// build.
+// made. A project's created checkpoint starts from one, given the images
+// it doesn't build.
 func imagesCheckpoint(images []string) (*checkpoint, error) {
 	images = slices.Compact(slices.Sorted(slices.Values(images)))
 	dir := filepath.Join(cache, "images", hash(images))
@@ -184,7 +207,11 @@ func imagesCheckpoint(images []string) (*checkpoint, error) {
 		fmt.Fprintf(os.Stderr, "timeskip: bundling %s: %v\n", strings.Join(images, " "), err)
 		return nil, err
 	}
-	return setupCheckpoint(mine, b, nil)
+	cp, err := createdCheckpoint(mine, b)
+	if err == nil {
+		prune(b, cp.dir)
+	}
+	return cp, err
 }
 
 // baseCheckpoint returns the base checkpoint, which every bundle's setup
@@ -379,22 +406,28 @@ func buildBase(c *checkpoint) {
 	c.meta = meta{Nonce: n, Kit: kitID()}
 }
 
-// build saves bundle b's setup checkpoint (b is, or will be, at origin):
-// a VM restored from checkpoint from (the base, or an images checkpoint),
-// given the bundle and edits, once it reports READY. If setup fails, it
-// shows why and returns the error.
-func build(c *checkpoint, b, origin string, from *checkpoint, edits []edit) error {
+// build saves one of bundle b's checkpoints (b is, or will be, at origin):
+// a VM restored from checkpoint from and sent verb. Given CREATE (from is
+// the base or an images checkpoint), the bundle's created checkpoint, once
+// it reports CREATED; given SETUP (from is the created checkpoint), its
+// setup checkpoint with edits applied, once it reports READY. If it fails,
+// it shows why and returns the error.
+func build(c *checkpoint, b, origin string, from *checkpoint, verb string, edits []edit) error {
 	if os.Link(b, c.bundle()) != nil {
 		clone(b, c.bundle())
 	}
-	if f := bundleFile(b, "format"); f != bundle.Format {
-		die("%s is a bundle of format %q, and this timeskip reads format %s: bundle the project again with this timeskip", b, f, bundle.Format)
+	if verb == "CREATE" {
+		if f := bundleFile(b, "format"); f != bundle.Format {
+			die("%s is a bundle of format %q, and this timeskip reads format %s: bundle the project again with this timeskip", b, f, bundle.Format)
+		}
+		a := bundleFile(b, "arch")
+		if a != hostArch {
+			die("%s is for linux/%s VMs, and this machine runs linux/%s ones (bundle it with --arch %s)", b, a, hostArch, hostArch)
+		}
+		fmt.Fprintf(os.Stderr, "timeskip: loading %s (a checkpoint for each version of a bundle)\n", filepath.Base(origin))
+	} else {
+		fmt.Fprintf(os.Stderr, "timeskip: setting up %s (a checkpoint for each version of its synced files)\n", filepath.Base(origin))
 	}
-	a := bundleFile(b, "arch")
-	if a != hostArch {
-		die("%s is for linux/%s VMs, and this machine runs linux/%s ones (bundle it with --arch %s)", b, a, hostArch, hostArch)
-	}
-	fmt.Fprintf(os.Stderr, "timeskip: setting up %s (a checkpoint for each version of a bundle)\n", filepath.Base(origin))
 	clone(from.file("disk"), c.file("disk"))
 	go writeOut(c.file("disk"))
 	if !darwin {
@@ -411,18 +444,24 @@ func build(c *checkpoint, b, origin string, from *checkpoint, edits []edit) erro
 		}
 		close(copied)
 	}()
-	if darwin {
+	// (On Linux its timelines' first drive is its own link to the bundle.)
+	if !darwin {
+		v.check(v.api("PATCH", "/drives/d0", map[string]string{"drive_id": "d0", "path_on_host": c.bundle()}))
+	}
+	switch {
+	case verb == "SETUP":
+		v.send(verb, "inputs="+in.spec)
+	case darwin:
 		check(os.Link(c.bundle(), c.file("inputs/bundle.tsb")))
-		v.send("SETUP", "bundle=virtiofs inputs="+in.spec)
-	} else {
+		v.send(verb, "bundle=virtiofs")
+	default:
 		st, err := os.Stat(c.bundle())
 		check(err)
-		v.check(v.api("PATCH", "/drives/d0", map[string]string{"drive_id": "d0", "path_on_host": c.bundle()}))
-		v.send("SETUP", fmt.Sprintf("bundle=blk:%d inputs=%s", st.Size(), in.spec))
+		v.send(verb, fmt.Sprintf("bundle=blk:%d", st.Size()))
 	}
 	l := v.next()
 	log := v.file("console.log")
-	if l.verb != "READY" {
+	if l.verb != map[string]string{"CREATE": "CREATED", "SETUP": "READY"}[verb] {
 		v.kill()
 		showTail(log, 40)
 		err := errors.New("the VM stopped")
@@ -440,7 +479,9 @@ func build(c *checkpoint, b, origin string, from *checkpoint, edits []edit) erro
 		return err
 	}
 	var ready protocol.Ready
-	check(json.Unmarshal([]byte(l.body), &ready))
+	if verb == "SETUP" {
+		check(json.Unmarshal([]byte(l.body), &ready))
+	}
 	<-copied
 	if in.img != "" { // (its timelines get the placeholder)
 		v.check(v.api("PATCH", "/drives/d2", map[string]string{"drive_id": "d2", "path_on_host": c.placeholder()}))
