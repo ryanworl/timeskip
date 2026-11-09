@@ -129,14 +129,17 @@ type timeline struct {
 	ContainerCPUMs map[string]int64 `json:"container_cpu_ms"`
 	Wakers         []waker
 	Assertions     []assertion
-	Faults         []struct {
-		Kind, Detail string
-		Targets      [][]string
-		AtMs         int64 `json:"at_ms"`
-		Ms           int64
-	}
-	FaultMix   string `json:"fault_mix"`
-	FaultGapMs int64  `json:"fault_gap_ms"`
+	Faults         []fault
+	Baseline       *fault
+	FaultMix       string `json:"fault_mix"`
+	FaultGapMs     int64  `json:"fault_gap_ms"`
+}
+
+type fault struct {
+	Kind, Detail string
+	Targets      [][]string
+	AtMs         int64 `json:"at_ms"`
+	Ms           int64
 }
 
 // commands are the names of the commands a timeline ran, sorted.
@@ -258,8 +261,12 @@ func TestDemo(t *testing.T) {
 		// many it gets before it ends varies.)
 		_, d, _ := run(t, "demo-seed-faults-a", "test", demo, "--seed", "43", "--set", "faults=high_availability", "--set", "fault_gap=100")
 		_, e, _ := run(t, "demo-seed-faults-b", "test", demo, "--seed", "43", "--set", "faults=high_availability", "--set", "fault_gap=100")
-		if len(d.Timelines)+len(e.Timelines) != 2 || len(d.Timelines[0].Faults) < 2 {
+		if len(d.Timelines)+len(e.Timelines) != 2 || len(d.Timelines[0].Faults) < 1 {
 			t.Fatal("no faults")
+		}
+		// The baseline latency is listed apart, not as a fault.
+		if b := d.Timelines[0].Baseline; b == nil || b.Kind != "latency" || slices.ContainsFunc(d.Timelines[0].Faults, func(f fault) bool { return f.Kind == "latency" }) {
+			t.Errorf("baseline %+v, faults %+v; want the latency as the baseline alone", b, d.Timelines[0].Faults)
 		}
 		// (In the order they started: results.json lists them as they
 		// healed, and the ending, whose moment varies with the host's
@@ -306,9 +313,9 @@ func TestDemo(t *testing.T) {
 		// Antithesis's fault tolerance levels: legacy has no node faults
 		// nor clock skips, resilient only pauses, throttles, CPU
 		// modulation, slowed or jammed clogs and clock skips.
-		for level, ok := range map[string]*regexp.Regexp{"legacy": regexp.MustCompile(`^(latency|partition|clog)`), "resilient": regexp.MustCompile(`^(latency|clog (slowed|jammed)|pause|throttle|modulation|skip)`)} {
+		for level, ok := range map[string]*regexp.Regexp{"legacy": regexp.MustCompile(`^(partition|clog)`), "resilient": regexp.MustCompile(`^(clog (slowed|jammed)|pause|throttle|modulation|skip)`)} {
 			_, r, _ := run(t, "demo-faults"+level, "test", demo, "--seed", "42", "--set", "faults="+level, "--set", "fault_gap=1", "--set", "timeout=30")
-			if len(r.Timelines) != 1 || len(r.Timelines[0].Faults) < 3 {
+			if len(r.Timelines) != 1 || len(r.Timelines[0].Faults) < 2 {
 				t.Fatalf("faults %s: no faults", level)
 			}
 			for _, f := range r.Timelines[0].Faults {

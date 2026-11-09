@@ -154,8 +154,9 @@ type Result struct {
 	Skips      int         `json:"skips"` // idle periods skipped
 	Commands   []Record    `json:"commands"`
 	Assertions []Assertion `json:"assertions"`
-	Errors     []string    `json:"errors"` // what went wrong besides
-	Faults     []Fault     `json:"faults,omitempty"`
+	Errors     []string    `json:"errors"`                 // what went wrong besides
+	Faults     []Fault     `json:"faults,omitempty"`       // the faults injected
+	Baseline   *Fault      `json:"baseline,omitempty"`     // with faults, the network's latency throughout, which isn't a fault
 	FaultMix   string      `json:"fault_mix,omitempty"`    // with a level that makes node faults, the half the timeline drew: "node faults" or "no node faults"
 	FaultGapMs int64       `json:"fault_gap_ms,omitempty"` // with faults, the most guest time between two that the timeline drew
 	TimedOut   bool        `json:"timed_out,omitempty"`    // it ran out of time: what ran was killed

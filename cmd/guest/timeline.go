@@ -227,6 +227,7 @@ type runner struct {
 	graces     sync.WaitGroup  // disk faults' graces under way (see injector.disk)
 	own        sync.Mutex      // held as a node fault takes a container down, and as a grace starts one (see injector.claimedStart)
 	faults     []protocol.Fault
+	baseline   *protocol.Fault
 	faultMix   string // the half of the mixture drawn, if any (see inject)
 	faultGapMs int64  // the most guest time between faults drawn, if any
 	failMs     int64  // when it failed (guest time since it started), or 0: a command failed, an assertion (see watchSDK), or a container exited unexpectedly (see over)
@@ -664,7 +665,7 @@ func (r *runner) finish() {
 	if r.kmsgLost > 0 {
 		r.errors = append(r.errors, fmt.Sprintf("crash: the kernel's log overwrote records before they were read (%d times): crashes among them aren't reported", r.kmsgLost))
 	}
-	commands, errs, faults, faultMix, faultGapMs, timedOut := r.records, r.errors, r.faults, r.faultMix, r.faultGapMs, r.timedOut
+	commands, errs, faults, baseline, faultMix, faultGapMs, timedOut := r.records, r.errors, r.faults, r.baseline, r.faultMix, r.faultGapMs, r.timedOut
 	r.mu.Unlock()
 	if len(errs) > 0 {
 		say("the services' last logs:")
@@ -691,7 +692,7 @@ func (r *runner) finish() {
 	noting.Lock() // (for good: see watch)
 	sdkScan()     // (the assertions' last first falses)
 	msg("EXIT", protocol.Exit{Kind: "timeline", Result: &protocol.Result{GuestMs: ms, Skips: skips() - r.s0,
-		Commands: commands, Assertions: assertions(), Errors: errs, Faults: faults, FaultMix: faultMix, FaultGapMs: faultGapMs, TimedOut: timedOut, ContainerCPUMs: cpu, Wakers: wakers(cs), Profile: stacks,
+		Commands: commands, Assertions: assertions(), Errors: errs, Faults: faults, Baseline: baseline, FaultMix: faultMix, FaultGapMs: faultGapMs, TimedOut: timedOut, ContainerCPUMs: cpu, Wakers: wakers(cs), Profile: stacks,
 		Coverage: cov, Symbols: syms, FailedMs: r.failMs}})
 	// (If it failed, the CLI asks for the containers' logs; if not, it
 	// stops the VM.)

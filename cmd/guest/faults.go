@@ -181,7 +181,7 @@ func (r *runner) inject(g protocol.Go) func() {
 		say("fault: %d thread pauses", pauseCount()-pauses)
 		base.Ms = (uptime() - r.t0).Milliseconds() - base.AtMs
 		r.mu.Lock()
-		r.faults = append(r.faults, base)
+		r.baseline = &base
 		r.mu.Unlock()
 	}
 }
